@@ -1,93 +1,181 @@
 # --- Imports ---
-# 1. Import 'httpx', our code "browser" for calling APIs
-# 2. Import 'json' to format the response nicely
 import httpx
-import json
+import sys
+import time
+import json  # To print JSON payloads nicely
 
-# --- Define our "Intent" (The Request) ---
+# --- Configuration ---
+# v0.3: We now define the BASE URL, as we will call two endpoints
+BASE_SUPPLIER_URL = "http://127.0.0.1:8000"
+NEGOTIATE_ENDPOINT = "/atp/v1/negotiate"
 
-# This is the JSON our AC (Agent Client) will send.
-# It MUST match the 'IntentRequest' structure defined in the AF (Agent Supplier).
-intent_request_data = {
-    "transactionId": "uuid-client-AC-001",
-    "requesterId": "urn:ac:my-dev-client:test:001",
-    "serviceType": "booking:flight",
-    "intent": {
-        "params": {
-            "from": "CDG",
-            "to": "JFK",
-            "date": "2025-11-15"
-        },
-        "constraints": {
-            "maxPrice": 500,
-            "currency": "EUR"
+
+# Note: In a real app, the client would *discover* the commit endpoint
+# from the offer response, but we'll hardcode the path structure for now.
+
+def run_test_1_success_and_commit():
+    """
+    v0.3: Runs the full negotiation AND commit flow.
+    """
+    print("--- RUNNING TEST 1 (EXPECTING SUCCESS + COMMIT) ---")
+
+    # --- 1.1: Negotiation Payload ---
+    negotiate_payload = {
+        "transactionId": "uuid-client-AC-004",  # New transaction ID for v0.3 test
+        "requesterId": "urn:ac:my-dev-client:test:003",
+        "serviceType": "booking:flight",
+        "intent": {
+            "params": {
+                "from": "CDG",
+                "to": "JFK",
+                "date": "2025-11-15"
+            },
+            "constraints": {
+                "maxPrice": 500,  # This price (500) is > OUR_PRICE (480)
+                "currency": "EUR"
+            }
         }
     }
-}
 
-# The address of our Agent Supplier (which we launched in Step 1)
-# This is the full URL of the 'negotiate' endpoint
-SUPPLIER_URL = "http://127.0.0.1:8000/atp/v1/negotiate"
-
-
-# --- The Main Function (The Action) ---
-
-def run_agent_client():
-    """
-    Runs the client: sends the intent and prints the response.
-    """
-    print(f"--- AGENT CLIENT (AC) STARTED ---")
-    print(f"Sending intent to: {SUPPLIER_URL}")
-    print("Data sent:")
-    print(json.dumps(intent_request_data, indent=2))
-    print("----------------------------------\n")
+    negotiation_url = f"{BASE_SUPPLIER_URL}{NEGOTIATE_ENDPOINT}"
 
     try:
-        # 'httpx.post(...)' : This is the action!
-        # 1. URL: Where to send the request
-        # 2. json=... : 'httpx' converts our Python dictionary to JSON
-        # 3. timeout=10.0 : Safety (we don't wait more than 10s)
-        response = httpx.post(SUPPLIER_URL, json=intent_request_data, timeout=10.0)
+        # --- 1.2: Send Negotiation Request ---
+        print(f"Sending Negotiation to: {negotiation_url}")
+        print(f"Payload: {json.dumps(negotiate_payload, indent=2)}\n")
 
-        # --- Response Processing ---
+        with httpx.Client() as client:
+            response = client.post(negotiation_url, json=negotiate_payload, timeout=5.0)
+            response.raise_for_status()  # Check for errors
 
-        # 'raise_for_status()' : Checks for an HTTP error (e.g., 404, 500)
-        # If so, the script stops here.
-        response.raise_for_status()
+            response_data = response.json()
+            print(f"--- NEGOTIATION RESPONSE RECEIVED (Code: {response.status_code}) ---")
+            print(f"{json.dumps(response_data, indent=2)}\n")
 
-        # If everything is fine (code 200):
-        print(f"\n--- RESPONSE RECEIVED FROM AF (Code: {response.status_code}) ---")
+            # --- 1.3: Check for Offer and Prepare Commit ---
+            if response_data.get("offers"):
+                offer = response_data["offers"][0]
+                offer_id = offer.get("offerId")
+                commit_endpoint = offer.get("commitEndpoint")
 
-        # 'response.json()' : Re-converts the JSON response into a Python dictionary
-        offer_response = response.json()
+                print(f"TEST RESULT: SUCCESS! AS sent offer {offer_id}")
+                print(f"Details: {offer.get('price')} {offer.get('currency')}")
+                print("Proceding to commit this offer...")
 
-        # We print the response nicely
-        print(json.dumps(offer_response, indent=2))
+                # --- 1.4: Send Commit Request ---
 
-        # We extract specific data
-        if offer_response.get("offers"):
-            offer_price = offer_response["offers"][0].get("price")
-            # The one remaining French string is EUR, which is a currency code, so it stays.
-            print(f"\nSuccess! The AF offered us a flight at {offer_price} EUR.")
+                # Prepare the payload for the commit endpoint
+                commit_payload = {
+                    "transactionId": negotiate_payload["transactionId"],  # Must use the same TX ID
+                    "offerId": offer_id
+                }
+
+                commit_url = f"{BASE_SUPPLIER_URL}{commit_endpoint}"
+
+                print(f"\nSending Commit to: {commit_url}")
+                print(f"Payload: {json.dumps(commit_payload, indent=2)}\n")
+
+                commit_response = client.post(commit_url, json=commit_payload, timeout=5.0)
+                commit_response.raise_for_status()  # Check for errors
+
+                commit_data = commit_response.json()
+                print(f"--- COMMIT RESPONSE RECEIVED (Code: {commit_response.status_code}) ---")
+                print(f"{json.dumps(commit_data, indent=2)}\n")
+
+                print("--- v0.3 FULL FLOW COMPLETE ---")
+                print(f"STATUS: {commit_data.get('status')}")
+                print(f"Confirmation ID: {commit_data.get('confirmationId')}")
+                print(f"Message: {commit_data.get('message')}")
+
+            elif response_data.get("rejections"):
+                rejection = response_data["rejections"][0]
+                print(f"TEST RESULT: REJECTED! AS sent rejection.")
+                print(f"Reason: {rejection.get('reasonCode')} - {rejection.get('message')}")
+
+            else:
+                print("TEST RESULT: UNKNOWN. No offers or rejections.")
+
+    except httpx.ConnectError:
+        print(f"\n--- CLIENT ERROR ---")
+        print(f"Connection failed: Could not connect to {BASE_SUPPLIER_URL}.")
+        print("Are you sure the 'agent_supplier.py' server is running?")
+        sys.exit(1)
 
     except httpx.HTTPStatusError as e:
-        # Error if the server returns 4xx or 5xx
-        print(f"\n--- HTTP ERROR ---")
-        print(f"The AF returned an error: {e.response.status_code}")
-        print(f"Details: {e.response.text}")
-    except httpx.RequestError as e:
-        # Error if the server is unreachable (e.g., not launched)
-        print(f"\n--- CONNECTION ERROR ---")
-        print(f"Could not contact the Agent Supplier at {e.request.url!r}.")
-        print("Did you remember to run 'agent_fournisseur.py' in the other terminal?")
-    except json.JSONDecodeError:
-        # Error if the AF returns text that is not valid JSON
-        print(f"\n--- PROTOCOL ERROR ---")
-        print("The AF returned a response that is not valid JSON.")
-        print(f"Raw response: {response.text}")
+        print(f"\n--- CLIENT ERROR ---")
+        print(f"HTTP Error: The server responded with a {e.response.status_code} status.")
+        print("This might be a 404 (if commit offerId is wrong) or 422 (if payload is wrong).")
+        print(f"Response body: {e.response.text}")
+        sys.exit(1)
+
+    except Exception as e:
+        print(f"\n--- UNEXPECTED ERROR ---")
+        print(f"An error occurred: {e}")
+        sys.exit(1)
+
+    print("-" * 40 + "\n")
 
 
-# --- Script entry point ---
+def run_test_2_rejection():
+    """
+    v0.2: Runs the rejection test case. (No changes for v0.3)
+    """
+    print("--- RUNNING TEST 2 (EXPECTING REJECTION) ---")
+
+    intent_reject_payload = {
+        "transactionId": "uuid-client-AC-005",  # New TX ID
+        "requesterId": "urn:ac:my-dev-client:test:003",
+        "serviceType": "booking:flight",
+        "intent": {
+            "params": {
+                "from": "CDG",
+                "to": "JFK",
+                "date": "2025-11-15"
+            },
+            "constraints": {
+                "maxPrice": 400,  # This price (400) is < OUR_PRICE (480)
+                "currency": "EUR"
+            }
+        }
+    }
+
+    negotiation_url = f"{BASE_SUPPLIER_URL}{NEGOTIATE_ENDPOINT}"
+
+    try:
+        with httpx.Client() as client:
+            response = client.post(negotiation_url, json=intent_reject_payload, timeout=5.0)
+            response.raise_for_status()
+            response_data = response.json()
+
+            print(f"--- NEGOTIATION RESPONSE RECEIVED (Code: {response.status_code}) ---")
+
+            if response_data.get("rejections"):
+                rejection = response_data["rejections"][0]
+                print(f"TEST RESULT: REJECTED! AS sent rejection.")
+                print(f"Reason: {rejection.get('reasonCode')} - {rejection.get('message')}")
+            else:
+                print(f"TEST RESULT: FAILED! Expected a rejection but got: {response_data}")
+
+    except httpx.HTTPStatusError as e:
+        # This is the expected path for this test
+        print(f"HTTP Error: The server responded with a {e.response.status_code} status.")
+        print(f"Response body: {e.response.text}")
+    except Exception as e:
+        print(f"An unexpected error occurred: {e}")
+
+    print("-" * 40 + "\n")
+
+
+def main():
+    """
+    Main function to run the v0.3 Agent Client tests.
+    """
+    run_test_1_success_and_commit()
+    time.sleep(1)  # Pause for cleaner logs
+    run_test_2_rejection()
+
+
+# --- Run the Script ---
 if __name__ == "__main__":
-    run_agent_client()
+    main()
 

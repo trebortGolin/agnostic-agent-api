@@ -1,133 +1,211 @@
 # --- Imports ---
-# 1. Import FastAPI to create our web application
-# 2. Import BaseModel from Pydantic to define our JSON "schemas"
-# 3. Import List from 'typing' to define data types (Removed Optional)
-from fastapi import FastAPI
-from pydantic import BaseModel  # Removed Field
-from typing import List
+# v0.3: We need 'HTTPException' to return errors (like 404)
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from typing import List, Optional
 
 # --- Application Initialization ---
-# Creates the "brain" of our agent supplier
 app = FastAPI(
     title="Agent Supplier (AS) ATP Prototype",
-    description="v0.1 implementation of the ATP specification",
-    version="0.1",
+    description="v0.3 implementation: Added /commit endpoint",
+    version="0.3",
 )
 
 
-# --- Data Schema Definitions (The "Grammar" of ATP) ---
-# These Python classes FORCE the JSON structure.
-# If an Agent Client sends JSON that doesn't match, FastAPI will reject it.
-# This is our protocol validation, implemented automatically.
+# --- v0.2: Strict Schema Definitions (Negotiation Phase) ---
 
-# Note: For v0.1, we are keeping the 'intent' field as a flexible 'dict'
-# to match the client's simple structure.
-# In v0.2, we would define these nested Pydantic models.
-#
-# from pydantic import Field
-# from typing import Optional
-#
-# class IntentParams(BaseModel):
-#     from_city: str = Field(..., alias="from", description="IATA code (e.g., CDG)")
-#     to_city: str = Field(..., alias="to", description="IATA code (e.g., JFK)")
-#     date: str = Field(..., description="Date in YYYY-MM-DD format")
-#
-# class IntentConstraints(BaseModel):
-#     maxPrice: Optional[int] = None
-#     currency: Optional[str] = None
-#     maxStops: Optional[int] = None
+class IntentParams(BaseModel):
+    from_city: str = Field(..., alias="from", description="IATA code (e.g., CDG)")
+    to_city: str = Field(..., alias="to", description="IATA code (e.g., JFK)")
+    date: str = Field(..., description="Date in YYYY-MM-DD format")
 
-# Main Schema for the REQUEST: IntentRequest
+
+class IntentConstraints(BaseModel):
+    maxPrice: Optional[int] = None
+    currency: Optional[str] = None
+
+
+class Intent(BaseModel):
+    params: IntentParams
+    constraints: IntentConstraints
+
+
 class IntentRequest(BaseModel):
     transactionId: str
     requesterId: str
     serviceType: str
-    # For v0.1, we keep 'intent' as a simple dictionary for flexibility.
-    intent: dict
+    intent: Intent
 
 
-# Schema for the 'details' of the offer
 class OfferDetails(BaseModel):
     flight: str
     departureTime: str
     arrivalTime: str
 
 
-# Main Schema for the RESPONSE: OfferResponse
+class Offer(BaseModel):
+    offerId: str
+    serviceType: str
+    details: OfferDetails
+    price: int
+    currency: str
+    expiresAt: str
+    commitEndpoint: str  # The client *must* use this endpoint
+
+
+class Rejection(BaseModel):
+    reasonCode: str
+    message: str
+
+
 class OfferResponse(BaseModel):
     transactionId: str
     negotiationId: str
-    offers: List[dict]  # A list of dictionaries (for v0.1)
-    rejections: List[dict]
+    offers: List[Offer]
+    rejections: List[Rejection]
 
 
-# --- The API Endpoint (The Agent's "Front Door") ---
+# --- v0.3: NEW Strict Schema Definitions (Commit Phase) ---
 
-# '@app.post(...)' is a "decorator":
-# It tells FastAPI: "When an HTTP POST request comes to '/atp/v1/negotiate',
-# execute the 'negotiate_transaction' function below."
+# This is the schema for the REQUEST to the /commit endpoint
+class CommitRequest(BaseModel):
+    transactionId: str  # Must match the original transactionId
+    offerId: str  # The specific offerId the client accepts
+
+
+# This is the schema for the RESPONSE from the /commit endpoint
+class CommitResponse(BaseModel):
+    transactionId: str
+    commitId: str
+    status: str
+    confirmationId: str
+    message: str
+
+
+# --- In-Memory "Database" (for demo purposes) ---
+# We need to "remember" the offer we made so we can validate the commit
+# In a real app, this would be a Redis cache or a database.
+# key: offerId, value: Offer object
+db_valid_offers = {}
+
+
+# --- Endpoint 1: Negotiation (/atp/v1/negotiate) ---
+
 @app.post("/atp/v1/negotiate", response_model=OfferResponse)
 async def negotiate_transaction(request: IntentRequest):
     """
-    This is the main ATP entry point (Phase 2).
-    It receives an 'IntentRequest' and MUST return an 'OfferResponse'.
+    v0.2 Logic: Validates intent and dynamically responds.
+    v0.3 Update: Now saves the valid offer to our 'database'.
     """
 
-    print("--- NEW ATP REQUEST RECEIVED ---")
-    print(f"Requester ID: {request.requesterId}")
+    print("\n--- NEW ATP v0.2 NEGOTIATION RECEIVED ---")
     print(f"Transaction ID: {request.transactionId}")
-    print(f"Service requested: {request.serviceType}")
-    print(f"Intent: {request.intent}")
+    print(f"Intent Constraints: {request.intent.constraints}")
 
-    # --- Business Logic (Static for this prototype) ---
-    # Here, a real AF would read the constraints (e.g., request.intent['constraints'])
-    # and query its real flight database.
+    client_max_price = request.intent.constraints.maxPrice
+    OUR_PRICE = 480
+    OUR_OFFER_ID = f"offer-af-{request.transactionId}"  # Make offerId unique
 
-    # For our prototype, we always return the same offer.
+    if client_max_price is not None and client_max_price < OUR_PRICE:
+        # Client's budget is too low. Reject.
+        print(f"Client maxPrice ({client_max_price}) is too low. Rejecting.")
+        rejection = Rejection(
+            reasonCode="PRICE_UNMET",
+            message=f"Offered price ({OUR_PRICE}) exceeds client's maxPrice constraint ({client_max_price})."
+        )
+        response = OfferResponse(
+            transactionId=request.transactionId,
+            negotiationId=f"uuid-supplier-v0.3-reject",
+            offers=[],
+            rejections=[rejection]
+        )
 
-    # 1. Create the static offer (based on the White Paper)
-    static_offer = {
-        "offerId": "offer-af-001",
-        "serviceType": "booking:flight",
-        "details": {
-            "flight": "AF006",
-            "departureTime": "2025-11-15T18:30:00Z",
-            "arrivalTime": "2025-11-15T21:00:00Z"
-        },
-        "price": 480,
-        "currency": "EUR",
-        "expiresAt": "2025-10-28T12:30:00Z",  # Put a future date/time
-        "commitEndpoint": "https://api.af.com/atp/v1/commit"  # Dummy
-    }
+    else:
+        # Client's budget is fine. Make the offer.
+        print(f"Client constraints met. Sending offer: {OUR_OFFER_ID}")
 
-    # 2. Build the final response
-    response_data = {
-        "transactionId": request.transactionId,  # We echo the client's ID
-        "negotiationId": "uuid-supplier-9876-AS",  # Our internal tracking ID
-        "offers": [static_offer],  # We place our offer in the list
-        "rejections": []
-    }
+        static_offer = Offer(
+            offerId=OUR_OFFER_ID,  # Use the unique offer ID
+            serviceType="booking:flight",
+            details=OfferDetails(
+                flight="AF006",
+                departureTime="2025-11-15T18:30:00Z",
+                arrivalTime="2025-11-15T21:00:00Z"
+            ),
+            price=OUR_PRICE,
+            currency="EUR",
+            expiresAt="2025-11-15T12:30:00Z",
+            # v0.3: Tell the client *exactly* which endpoint to call to commit
+            commitEndpoint="/atp/v1/commit"
+        )
 
-    print("--- ATP RESPONSE SENT ---")
-    print(response_data)
+        # v0.3: Save this valid offer to our "database" so we can check it later
+        db_valid_offers[OUR_OFFER_ID] = static_offer
 
-    # 3. Return the response.
-    # FastAPI will validate it (thanks to 'response_model=OfferResponse')
-    # and convert it to JSON to send to the client.
-    return response_data
+        response = OfferResponse(
+            transactionId=request.transactionId,
+            negotiationId=f"uuid-supplier-v0.3-offer",
+            offers=[static_offer],
+            rejections=[]
+        )
+
+    print("--- ATP v0.2 NEGOTIATION RESPONSE SENT ---")
+    return response
+
+
+# --- v0.3: NEW Endpoint 2: Commit (/atp/v1/commit) ---
+
+@app.post("/atp/v1/commit", response_model=CommitResponse)
+async def commit_transaction(request: CommitRequest):
+    """
+    v0.3: This endpoint receives the client's acceptance of an offer.
+    It validates the offerId and confirms the "booking".
+    """
+
+    print("\n--- NEW ATP v0.3 COMMIT RECEIVED ---")
+    print(f"Transaction ID: {request.transactionId}")
+    print(f"Attempting to commit Offer ID: {request.offerId}")
+
+    # --- v0.3: Validation Logic ---
+    # Check if the offerId from the client is one we actually made
+    if request.offerId not in db_valid_offers:
+        print(f"COMMIT FAILED: Offer ID '{request.offerId}' not found in database.")
+        # If not, raise an HTTP 404 (Not Found) error
+        raise HTTPException(
+            status_code=404,
+            detail=f"Offer ID '{request.offerId}' not found or expired."
+        )
+
+    # If we are here, the offer is valid!
+    # In a real app, we would now charge the credit card, book the seat, etc.
+
+    # We can safely remove the offer from the DB so it can't be used again
+    offer_details = db_valid_offers.pop(request.offerId)
+
+    print(f"COMMIT SUCCESS: Offer {request.offerId} (Flight {offer_details.details.flight}) confirmed.")
+
+    # Create a final confirmation ID
+    confirmation_code = f"CONF-{request.transactionId.split('-')[-1]}"
+
+    # Send the final successful response
+    response = CommitResponse(
+        transactionId=request.transactionId,
+        commitId=f"commit-{request.offerId}",
+        status="CONFIRMED",
+        confirmationId=confirmation_code,
+        message="Your flight is confirmed."
+    )
+
+    print("--- ATP v0.3 COMMIT RESPONSE SENT ---")
+    return response
 
 
 # --- Run the Server (When executing this file directly) ---
 if __name__ == "__main__":
     import uvicorn
 
-    print("Starting Agent Supplier (AS) server on http://127.0.0.1:8000")
-    # 'app' : the FastAPI object
-    # 'host' : "127.0.0.1" (localhost, your machine)
-    # 'port' : 8000 (the "door" we are listening on)
-    # 'reload' : True (the server restarts if we change the code, very useful)
+    print("Starting Agent Supplier (AS) server v0.3 on http://127.0.0.1:8000")
 
-    # --- FIX ---
-    # Renamed "Agent_supplier:app" to "agent_supplier:app" to match
-    # standard Python module naming (lowercase).
+    # We must use the lowercase filename "agent_supplier" here
     uvicorn.run("agent_supplier:app", host="127.0.0.1", port=8000, reload=True)
+
