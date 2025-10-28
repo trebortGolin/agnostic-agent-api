@@ -1,299 +1,305 @@
-# --- Imports ---
-import httpx
-import sys
-import time
-import json  # To print JSON payloads nicely
-from pydantic import BaseModel
-from typing import List, Dict, Optional
-import uuid
-import asyncio  # v0.7: Import asyncio for concurrent requests
+# --- AGENT CLIENT (AC) v1.0 (LLM-Powered) ---
+# Ce client simule un agent conversationnel capable de comprendre
+# une demande de vol, d'appeler une API (simulée) et de générer une réponse.
+# v1.0: Introduction d'une boucle de conversation et d'une mémoire (state)
+#       pour permettre le "slot-filling" (complétion des informations).
 
-# --- v0.6: Security Configuration ---
-# We must match the key defined in 'agent_directory.py'
-DIRECTORY_URL = "http://127.0.0.1:8001"
-DIRECTORY_API_KEY = "dummy-secret-key-12345"  # The "password" for the directory
-API_KEY_NAME = "X-ATP-Directory-Key"  # The "header" name for the key
+import google.generativeai as genai
+import json
+import os
+import re
 
-# --- v0.5: Service Configuration ---
-SERVICE_TO_FIND = "booking:flight"
+# --- 1. CONFIGURATION ---
+try:
+    GOOGLE_API_KEY = os.environ.get("GEMINI_API_KEY")
+    if not GOOGLE_API_KEY:
+        raise ValueError("La variable d'environnement GEMINI_API_KEY n'est pas définie.")
+
+    genai.configure(api_key=GOOGLE_API_KEY)
+except Exception as e:
+    print(f"--- ERREUR DE CONFIGURATION ---")
+    print(f"Erreur: {e}")
+    print("Veuillez définir votre GEMINI_API_KEY avant de lancer le script.")
+    print("Exemple: export GEMINI_API_KEY=\"votre_cle_ici\"")
+    exit()
+
+# --- v1.0: DEUX CERVEAUX (NLU et NLG) ---
+
+# --- CERVEAU NLU (Phase 0) ---
+# Le prompt NLU est mis à jour pour gérer le contexte (l'état précédent)
+NLU_SYSTEM_PROMPT = """
+Tu es un agent NLU (Natural Language Understanding) expert pour une compagnie aérienne.
+Ta seule tâche est de mettre à jour un objet JSON basé sur la demande de l'utilisateur.
+Ne réponds RIEN d'autre que le JSON final.
+
+Tu recevras:
+1.  "État JSON précédent": L'état de la conversation (peut être vide {}).
+2.  "Demande utilisateur actuelle": Ce que l'utilisateur vient de dire.
+
+Tes règles:
+- Si la demande utilisateur est une *nouvelle* recherche (ex: "Je veux un vol pour NY"),
+  ignore l'état précédent et crée un NOUVEAU JSON complet.
+- Si la demande utilisateur est une *réponse* (ex: "De Paris", ou "le 15 décembre"),
+  UTILISE l'état JSON précédent et AJOUTE ou MODIFIE seulement les informations
+  fournies (ex: "origin": "Paris").
+- Reporte toujours les informations de l'état précédent si elles ne sont pas
+  modifiées par l'utilisateur.
+- Si l'utilisateur change d'avis (ex: "finalement je veux aller à Londres"),
+  mets à jour la destination.
+
+L'objet JSON doit toujours avoir cette structure :
+{
+  "intent": "SEARCH_FLIGHT",
+  "entities": {
+    "origin": "VILLE_OU_CODE_IATA" (ou null),
+    "destination": "VILLE_OU_CODE_IATA" (ou null),
+    "departure_date": "YYYY-MM-DD" (ou null),
+    "return_date": "YYYY-MM-DD" (ou null),
+    "max_price": INT (ou null),
+    "currency": "EUR" (ou "USD", "CAD", etc. ou null)
+  }
+}
+"""
+
+nlu_generation_config = {
+    "temperature": 0.0,
+    "top_p": 1,
+    "top_k": 1,
+    "max_output_tokens": 2048,
+}
+
+MODEL_NAME_TO_USE = "gemini-2.5-flash"
+
+# Initialisation du modèle NLU
+llm_nlu = genai.GenerativeModel(
+    model_name=MODEL_NAME_TO_USE,
+    generation_config=nlu_generation_config,
+    system_instruction=NLU_SYSTEM_PROMPT
+)
+
+# --- CERVEAU NLG (Phase 2) ---
+NLG_SYSTEM_PROMPT = """
+Tu es un agent de voyage conversationnel, amical et serviable.
+Ta tâche est de répondre à la demande de l'utilisateur en te basant sur les données de vol trouvées (au format JSON).
+
+- Sois toujours amical et utilise un ton naturel.
+- Si un vol est trouvé (`flight_data` n'est pas vide):
+    - Présente les détails du vol (compagnie, prix).
+    - NE mentionne PAS l'ID du vol (ex: "AF006"), c'est interne. Dis juste "un vol Air France".
+    - Si le prix du vol est supérieur au `max_price` de l'utilisateur, signale-le poliment.
+- Si aucun vol n'est trouvé (`flight_data` est "null" MAIS les entités sont complètes):
+    - Informe poliment l'utilisateur qu'aucun vol ne correspond.
+- Si la demande initiale était trop vague ou incomplète (`flight_data` est "null"
+  ET certaines entités dans `conversation_state` sont "null"):
+    - Regarde `conversation_state` pour voir ce qui manque (origin, destination, ou departure_date).
+    - Demande gentiment *une seule* information manquante à la fois. (Ex: "D'où partez-vous ?")
+"""
+
+nlg_generation_config = {
+    "temperature": 0.7,
+    "top_p": 1,
+    "top_k": 1,
+    "max_output_tokens": 2048,
+}
+
+# Initialisation du modèle NLG
+llm_nlg = genai.GenerativeModel(
+    model_name=MODEL_NAME_TO_USE,
+    generation_config=nlg_generation_config,
+    system_instruction=NLG_SYSTEM_PROMPT
+)
 
 
-# --- v0.5: Client-side Data Models ---
-# These help our client understand the data it receives
+# --- 2. FONCTIONS DE L'AGENT ---
 
-class SupplierInfo(BaseModel):
+def clean_json_string(s):
     """
-    A minimal representation of a supplier, as discovered
-    from the Agent Directory.
-    v0.6: Now includes 'isVerified'
+    Nettoie la sortie brute du LLM pour ne garder que le JSON valide.
+    Enlève les ```json ... ``` et autres textes parasites.
     """
-    supplierId: str
-    name: str
-    baseUrl: str
-    isVerified: bool  # v0.6: We will check this flag
+    start_index = s.find('{')
+    end_index = s.rfind('}')
 
+    if start_index != -1 and end_index != -1 and end_index > start_index:
+        return s[start_index:end_index + 1]
 
-class Offer(BaseModel):
-    """
-    A minimal representation of an offer received from a supplier.
-    We add 'supplier_name' and 'supplier_base_url' for our own tracking.
-    """
-    offerId: str
-    price: float
-    currency: str
-    commitEndpoint: str
-    supplier_name: str  # v0.5: Added for tracking
-    supplier_base_url: str  # v0.5: Added for tracking
-
-
-# --- v0.7: Main Client Logic (Asynchronous) ---
-
-async def discover_suppliers(client: httpx.AsyncClient, service_type: str) -> List[SupplierInfo]:
-    """
-    v0.7: Calls the Agent Directory asynchronously.
-    1. Sends the required API Key in the headers.
-    2. Filters for 'requireVerified=True' by default.
-    """
-    print(f"--- 1. DISCOVERY PHASE (v0.7 Async Trust Mode) ---")
-    discover_url = f"{DIRECTORY_URL}/discover"
-
-    # v0.6: Define the query parameters
-    params = {
-        "serviceType": service_type,
-        "requireVerified": True  # We only want trusted suppliers
-    }
-
-    # v0.6: Define the security headers
-    headers = {
-        API_KEY_NAME: DIRECTORY_API_KEY
-    }
-
-    print(f"Asking Directory ({discover_url}) for service: '{service_type}'")
-    print(f"Filtering for verified suppliers only.")
-    print(f"Authenticating with API Key...")
-
-    try:
-        # v0.7: Use 'await client.get'
-        response = await client.get(discover_url, params=params, headers=headers, timeout=5.0)
-
-        # Check for auth failure
-        if response.status_code == 403:
-            print("\n--- CLIENT ERROR (403 Forbidden) ---")
-            print(
-                "The Directory rejected our API Key. Check that 'DIRECTORY_API_KEY' matches in both client and directory files.")
-            sys.exit(1)
-
-        response.raise_for_status()  # Check for other HTTP errors
-
-        data = response.json()
-        suppliers_data = data.get("suppliers", [])
-
-        if not suppliers_data:
-            print(f"Discovery FAILED: No verified suppliers found for '{service_type}'")
-            return []
-
-        # Parse the suppliers into our model
-        found_suppliers = [SupplierInfo(**s) for s in suppliers_data]
-
-        print(f"Discovery SUCCESS: Found {len(found_suppliers)} verified suppliers.")
-        for s in found_suppliers:
-            print(f"  - {s.name} at {s.baseUrl} (Verified: {s.isVerified})")
-        print("-" * 40 + "\n")
-        return found_suppliers
-
-    except httpx.ConnectError:
-        print(f"\n--- CLIENT ERROR ---")
-        print(f"Connection failed: Could not connect to Directory at {DIRECTORY_URL}.")
-        print("Are you sure 'agent_directory.py' is running on port 8001?")
-        sys.exit(1)
-    except httpx.HTTPStatusError as e:
-        print(f"\n--- CLIENT ERROR ---")
-        print(f"HTTP Error: The Directory responded with a {e.response.status_code} status.")
-        print(f"Response body: {e.response.text}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"\n--- UNEXPECTED ERROR during Discovery ---")
-        print(f"An error occurred: {e}")
-        sys.exit(1)
-
-
-async def negotiate_with_single_supplier(client: httpx.AsyncClient, supplier: SupplierInfo, intent_payload: dict) -> \
-Optional[Offer]:
-    """
-    v0.7: Helper function to negotiate with ONE supplier.
-    This function is designed to be run concurrently.
-    """
-    negotiation_url = f"{supplier.baseUrl}/atp/v1/negotiate"
-
-    # Give this negotiation a unique transaction ID
-    payload = intent_payload.copy()  # Make a copy to avoid race conditions
-    payload["transactionId"] = f"tx-{uuid.uuid4()}"
-
-    try:
-        print(f"...Negotiating with {supplier.name} at {negotiation_url}")
-
-        # v0.7: Use 'await client.post'
-        response = await client.post(negotiation_url, json=payload, timeout=5.0)
-        response.raise_for_status()
-
-        response_data = response.json()
-
-        if response_data.get("offers"):
-            offer_data = response_data["offers"][0]
-            valid_offer = Offer(
-                **offer_data,
-                supplier_name=supplier.name,
-                supplier_base_url=supplier.baseUrl
-            )
-            print(f"SUCCESS: {supplier.name} offered {valid_offer.price} {valid_offer.currency}")
-            return valid_offer
-
-        elif response_data.get("rejections"):
-            rejection_msg = response_data["rejections"][0]["message"]
-            print(f"REJECTED: {supplier.name} rejected intent. Reason: {rejection_msg}")
-            return None
-
-    except httpx.ConnectError:
-        print(f"SKIPPED: Could not connect to {supplier.name} at {supplier.baseUrl}")
-    except httpx.HTTPStatusError as e:
-        print(f"SKIPPED: {supplier.name} responded with HTTP {e.response.status_code}")
-    except Exception as e:
-        print(f"SKIPPED: An unexpected error occurred with {supplier.name}: {e}")
-
+    print(f"--- AVERTISSEMENT NLU: Impossible de nettoyer le JSON ---")
+    print(f"Réponse brute: {s}")
     return None
 
 
-async def negotiate_with_suppliers_concurrently(client: httpx.AsyncClient, suppliers: List[SupplierInfo],
-                                                intent_payload: dict) -> List[Offer]:
+def nlu_phase_llm(user_prompt, previous_state):
     """
-    v0.7: Main negotiation function.
-    Uses asyncio.gather to run all negotiations concurrently.
+    Phase 0: NLU (Natural Language Understanding) - v1.0
+    Utilise le LLM pour *mettre à jour* l'état de la conversation.
     """
-    print(f"--- 2. NEGOTIATION PHASE (v0.7 Concurrent Mode) ---")
-    print(f"Sending intent to {len(suppliers)} verified suppliers *at the same time*...")
+    print("--- 0. NLU PHASE (v1.0 Conversational Brain) ---")
+    print(f"User prompt: \"{user_prompt}\"")
+    print(f"--- DÉBOGAGE: Tentative d'utilisation du modèle NLU: '{MODEL_NAME_TO_USE}' ---")
 
-    # Create a list of "tasks" to run concurrently
-    tasks = [
-        negotiate_with_single_supplier(client, supplier, intent_payload)
-        for supplier in suppliers
-    ]
+    # Prépare le contexte pour le NLU, incluant l'état précédent
+    nlu_context = f"""
+    État JSON précédent:
+    {json.dumps(previous_state, indent=2)}
 
-    # v0.7: Run all tasks concurrently and wait for them to finish
-    results = await asyncio.gather(*tasks)
+    Demande utilisateur actuelle:
+    "{user_prompt}"
 
-    # Filter out any 'None' results (failures/rejections)
-    all_valid_offers = [offer for offer in results if offer is not None]
-
-    print("\n--- Negotiation Phase Complete ---")
-    print(f"Collected {len(all_valid_offers)} valid offers.")
-    print("-" * 40 + "\n")
-    return all_valid_offers
-
-
-async def select_and_commit_best_offer(client: httpx.AsyncClient, offers: List[Offer], original_tx_id: str):
+    JSON mis à jour:
     """
-    v0.7: Updated to be an 'async' function and use 'await client.post'.
-    """
-    print(f"--- 3. COMMITMENT PHASE ---")
 
-    if not offers:
-        print("No valid offers received. Cannot commit.")
-        print("TEST FAILED.")
-        return
-
-    # --- Selection Logic (No change) ---
-    offers.sort(key=lambda o: o.price)
-    best_offer = offers[0]
-
-    print(f"Found {len(offers)} offers. Selecting the best one:")
-    print(f"  - Winner: {best_offer.supplier_name} with {best_offer.price} {best_offer.currency}")
-
-    # --- Commit Logic ---
-    commit_payload = {
-        "transactionId": original_tx_id,
-        "offerId": best_offer.offerId
-    }
-
-    commit_url = f"{best_offer.supplier_base_url}{best_offer.commitEndpoint}"
+    print("Contacting Gemini API to parse and update intent...")
 
     try:
-        print(f"\nSending Commit to winner: {best_offer.supplier_name} at {commit_url}")
-        print(f"Payload: {json.dumps(commit_payload, indent=2)}\n")
+        # Utilise le modèle NLU
+        response = llm_nlu.generate_content(nlu_context)
+        raw_text = response.text
 
-        # v0.7: Use 'await client.post'
-        commit_response = await client.post(commit_url, json=commit_payload, timeout=5.0)
-        commit_response.raise_for_status()
+    except Exception as e:
+        print(f"\n--- ERREUR INATTENDUE pendant la phase NLU ---")
+        print(f"Erreur: {e}")
+        print("Vérifiez votre clé API, votre connexion et la configuration du modèle.")
+        return previous_state  # Renvoie l'ancien état en cas d'erreur
 
-        commit_data = commit_response.json()
-        print(f"--- COMMIT RESPONSE RECEIVED (Code: {commit_response.status_code}) ---")
-        print(f"{json.dumps(commit_data, indent=2)}\n")
+    # Nettoyage et parsing du JSON
+    json_string = clean_json_string(raw_text)
+    if not json_string:
+        print(f"--- ERREUR NLU: Réponse non JSON ou malformée reçue ---")
+        print(f"Réponse brute: {raw_text}")
+        return previous_state  # Renvoie l'ancien état
 
-        print(f"--- v0.7 FULL FLOW COMPLETE ---")
-        print(f"STATUS: {commit_data.get('status')}")
-        print(f"Confirmation ID: {commit_data.get('confirmationId')}")
-        print(f"Message: {commit_data.get('message')}")
-        print("\nTEST SUCCEEDED!")
-
-    except httpx.ConnectError:
-        print(f"COMMIT FAILED: Could not connect to {best_offer.supplier_name}")
-    except httpx.HTTPStatusError as e:
-        print(f"COMMIT FAILED: {best_offer.supplier_name} responded with HTTP {e.response.status_code}")
-        print(f"Response body: {e.response.text}")
-
-    print("-" * 40 + "\n")
+    try:
+        updated_state = json.loads(json_string)
+        print("Intent mis à jour avec succès:")
+        print(json.dumps(updated_state, indent=2))
+        return updated_state
+    except json.JSONDecodeError:
+        print(f"--- ERREUR NLU: JSON invalide après nettoyage ---")
+        print(f"JSON nettoyé (tentative): {json_string}")
+        return previous_state  # Renvoie l'ancien état
 
 
-async def main():
+def core_processing_phase(conversation_state):
     """
-    v0.7: Main function, now asynchronous.
-    1. Securely Discover ALL *verified* suppliers.
-    2. Negotiate with them *concurrently*.
-    3. Select the BEST offer and commit.
+    Phase 1: Core Processing (Simulation) - v1.0
+    Tente d'appeler l'API *seulement si* les informations requises sont présentes.
     """
+    print("\n--- 1. CORE PROCESSING PHASE (Simulation) ---")
 
-    shopping_intent = {
-        "transactionId": f"tx-main-{uuid.uuid4()}",
-        "requesterId": "urn:ac:my-dev-client:test:007",  # Incremented version
-        "serviceType": "booking:flight",
-        "intent": {
-            "params": {
-                "from": "CDG",
-                "to": "JFK",
-                "date": "2025-11-15"
-            },
-            "constraints": {
-                "maxPrice": 500,
-                "currency": "EUR"
-            }
+    if not conversation_state or conversation_state.get("intent") != "SEARCH_FLIGHT":
+        print("Erreur: Intent non valide ou non reconnu.")
+        return None
+
+    entities = conversation_state.get("entities", {})
+    origin = entities.get("origin")
+    destination = entities.get("destination")
+    date = entities.get("departure_date")
+
+    # Vérification cruciale : n'appelle l'API que si nous avons les 3 infos clés
+    if not all([origin, destination, date]):
+        print("Entités requises (origine, destination, date) manquantes.")
+        print("Saut de l'appel API. La phase NLG demandera des clarifications.")
+        return None
+
+    print(f"Appel (simulé) de l'API de vol pour: {origin} -> {destination} le {date}")
+
+    # --- SCÉNARIOS DE SIMULATION ---
+    user_max_price = entities.get("max_price")
+
+    if user_max_price and user_max_price < 500:
+        print("Réponse (simulée): Vol trouvé, mais supérieur au budget.")
+        return {
+            "flight_id": "AF012", "airline": "Air France",
+            "origin": origin, "destination": destination,
+            "departure_time": f"{date}T10:00:00", "arrival_time": f"{date}T13:00:00",
+            "price": 550.00,
+            "currency": entities.get("currency", "EUR")
         }
+
+    print("Réponse (simulée): Vol trouvé, prix OK.")
+    return {
+        "flight_id": "AF006", "airline": "Air France",
+        "origin": origin, "destination": destination,
+        "departure_time": f"{date}T09:00:00", "arrival_time": f"{date}T12:00:00",
+        "price": 489.99,
+        "currency": entities.get("currency", "EUR")
     }
 
-    # v0.7: We now use an AsyncClient
-    async with httpx.AsyncClient() as client:
-        # 1. Discover
-        # All functions must be 'awaited'
-        suppliers = await discover_suppliers(client, SERVICE_TO_FIND)
 
-        if not suppliers:
-            print("Exiting due to discovery failure.")
-            sys.exit(1)
+def generation_phase_llm(flight_data, user_prompt, conversation_state):
+    """
+    Phase 2: Generation (NLG - Natural Language Generation) - v1.0
+    Utilise le LLM (Gemini) pour générer une réponse naturelle basée sur l'état.
+    """
+    print("\n--- 2. GENERATION PHASE (v1.0 LLM Brain) ---")
 
-        # 2. Negotiate
-        # We call our new concurrent function
-        all_offers = await negotiate_with_suppliers_concurrently(client, suppliers, shopping_intent)
+    # 1. Préparer le contexte pour le LLM NLG
+    context = f"""
+    Demande originale de l'utilisateur: "{user_prompt}"
 
-        # 3. Commit
-        await select_and_commit_best_offer(client, all_offers, shopping_intent["transactionId"])
+    État actuel de la conversation (JSON parsé par le NLU):
+    {json.dumps(conversation_state, indent=2)}
+
+    Données de vol trouvées (résultat de l'API Core):
+    {json.dumps(flight_data, indent=2) if flight_data else "null"}
+
+    Ta réponse:
+    """
+
+    print(f"--- DÉBOGAGE: Tentative d'utilisation du modèle NLG: '{MODEL_NAME_TO_USE}' ---")
+    print("Contacting Gemini API to generate response...")
+
+    try:
+        # 2. Appeler le modèle NLG
+        response = llm_nlg.generate_content(context)
+        final_response = response.text
+
+        print("Réponse générée avec succès.")
+        return final_response
+
+    except Exception as e:
+        print(f"\n--- ERREUR INATTENDUE pendant la phase NLG ---")
+        print(f"Erreur: {e}")
+        return "Je suis désolé, une erreur interne est survenue lors de la génération de ma réponse."
 
 
-# --- Run the Script ---
+# --- 3. EXÉCUTION PRINCIPALE ---
+
 if __name__ == "__main__":
-    # v0.7: We must use asyncio.run() to start the main async function
-    print("--- AGENT CLIENT (AC) v0.7 (Async) STARTED ---")
-    start_time = time.time()
+    print(f"--- AGENT CLIENT (AC) v1.0 (Conversational) STARTED ---")
+    print("Tapez 'quitter' pour arrêter.")
 
-    asyncio.run(main())
+    # Initialisation de la mémoire de conversation
+    conversation_state = {}
 
-    end_time = time.time()
-    print(f"\n--- Total execution time: {end_time - start_time:.2f} seconds ---")
+    # Boucle de conversation
+    while True:
+        print("\n" + "=" * 50)
+        # 1. Obtenir l'entrée utilisateur
+        user_input = input("Vous: ")
+
+        if user_input.lower() in ["quitter", "exit", "stop", "bye"]:
+            print("AGENT: Au revoir !")
+            break
+
+        # Phase 0: NLU (Mise à jour de l'état)
+        # L'état est mis à jour à chaque tour
+        conversation_state = nlu_phase_llm(user_input, conversation_state)
+
+        if not conversation_state:
+            print("AGENT: Je suis désolé, je n'ai pas pu traiter cette demande.")
+            # Réinitialiser l'état pour éviter les erreurs
+            conversation_state = {}
+            continue
+
+        # Phase 1: Core Processing (Appel API si l'état est complet)
+        flight_results = core_processing_phase(conversation_state)
+
+        # Phase 2: Génération de la réponse (LLM)
+        final_response = generation_phase_llm(flight_results, user_input, conversation_state)
+
+        # Résultat final
+        print(f"AGENT: {final_response}")
+
+    print("--- AGENT CLIENT FINISHED ---")
 
