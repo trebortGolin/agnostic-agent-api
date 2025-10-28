@@ -3,13 +3,17 @@ import httpx
 import sys
 import time
 import json  # To print JSON payloads nicely
-from typing import List, Dict, Optional
 from pydantic import BaseModel
+from typing import List, Dict, Optional
 import uuid
 
-
-# --- v0.5: Configuration ---
+# --- v0.6: Security Configuration ---
+# We must match the key defined in 'agent_directory.py'
 DIRECTORY_URL = "http://127.0.0.1:8001"
+DIRECTORY_API_KEY = "dummy-secret-key-12345"  # The "password" for the directory
+API_KEY_NAME = "X-ATP-Directory-Key"  # The "header" name for the key
+
+# --- v0.5: Service Configuration ---
 SERVICE_TO_FIND = "booking:flight"
 
 
@@ -20,10 +24,12 @@ class SupplierInfo(BaseModel):
     """
     A minimal representation of a supplier, as discovered
     from the Agent Directory.
+    v0.6: Now includes 'isVerified'
     """
     supplierId: str
     name: str
     baseUrl: str
+    isVerified: bool  # v0.6: We will check this flag
 
 
 class Offer(BaseModel):
@@ -39,36 +45,59 @@ class Offer(BaseModel):
     supplier_base_url: str  # v0.5: Added for tracking
 
 
-# --- v0.5: Main Client Logic ---
+# --- v0.6: Main Client Logic (Updated) ---
 
 def discover_suppliers(client: httpx.Client, service_type: str) -> List[SupplierInfo]:
     """
-    v0.5: Calls the Agent Directory.
-    Returns a LIST of suppliers found.
+    v0.6: Calls the Agent Directory.
+    1. Sends the required API Key in the headers.
+    2. Filters for 'requireVerified=True' by default.
     """
-    print(f"--- 1. DISCOVERY PHASE ---")
+    print(f"--- 1. DISCOVERY PHASE (v0.6 Trust Mode) ---")
     discover_url = f"{DIRECTORY_URL}/discover"
-    params = {"serviceType": service_type}
+
+    # v0.6: Define the query parameters
+    params = {
+        "serviceType": service_type,
+        "requireVerified": True  # We only want trusted suppliers
+    }
+
+    # v0.6: Define the security headers
+    headers = {
+        API_KEY_NAME: DIRECTORY_API_KEY
+    }
 
     print(f"Asking Directory ({discover_url}) for service: '{service_type}'")
+    print(f"Filtering for verified suppliers only.")
+    print(f"Authenticating with API Key...")
 
     try:
-        response = client.get(discover_url, params=params, timeout=5.0)
-        response.raise_for_status()
-        data = response.json()
+        # v0.6: Send the request with both params and headers
+        response = client.get(discover_url, params=params, headers=headers, timeout=5.0)
 
+        # Check for auth failure
+        if response.status_code == 403:
+            print("\n--- CLIENT ERROR (403 Forbidden) ---")
+            print(
+                "The Directory rejected our API Key. Check that 'DIRECTORY_API_KEY' matches in both client and directory files.")
+            sys.exit(1)
+
+        response.raise_for_status()  # Check for other HTTP errors
+
+        data = response.json()
         suppliers_data = data.get("suppliers", [])
 
         if not suppliers_data:
-            print(f"Discovery FAILED: No suppliers found for '{service_type}'")
+            print(f"Discovery FAILED: No verified suppliers found for '{service_type}'")
             return []
 
         # Parse the suppliers into our model
         found_suppliers = [SupplierInfo(**s) for s in suppliers_data]
 
-        print(f"Discovery SUCCESS: Found {len(found_suppliers)} suppliers.")
+        print(f"Discovery SUCCESS: Found {len(found_suppliers)} verified suppliers.")
         for s in found_suppliers:
-            print(f"  - {s.name} at {s.baseUrl}")
+            # v0.6: We can see the "FlyByNight" (unverified) supplier is now filtered out.
+            print(f"  - {s.name} at {s.baseUrl} (Verified: {s.isVerified})")
         print("-" * 40 + "\n")
         return found_suppliers
 
@@ -80,6 +109,7 @@ def discover_suppliers(client: httpx.Client, service_type: str) -> List[Supplier
     except httpx.HTTPStatusError as e:
         print(f"\n--- CLIENT ERROR ---")
         print(f"HTTP Error: The Directory responded with a {e.response.status_code} status.")
+        print(f"Response body: {e.response.text}")
         sys.exit(1)
     except Exception as e:
         print(f"\n--- UNEXPECTED ERROR during Discovery ---")
@@ -89,11 +119,11 @@ def discover_suppliers(client: httpx.Client, service_type: str) -> List[Supplier
 
 def negotiate_with_suppliers(client: httpx.Client, suppliers: List[SupplierInfo], intent_payload: dict) -> List[Offer]:
     """
-    v0.5: Iterates through all suppliers, sends a negotiation request
-    to each, and collects all valid offers.
+    v0.6: No changes required to this function.
+    It iterates through the (now filtered) list of suppliers.
     """
     print(f"--- 2. NEGOTIATION PHASE ---")
-    print(f"Sending intent to {len(suppliers)} suppliers...")
+    print(f"Sending intent to {len(suppliers)} verified suppliers...")
 
     all_valid_offers: List[Offer] = []
 
@@ -112,10 +142,7 @@ def negotiate_with_suppliers(client: httpx.Client, suppliers: List[SupplierInfo]
             response_data = response.json()
 
             if response_data.get("offers"):
-                # Supplier made an offer!
                 offer_data = response_data["offers"][0]
-
-                # Store the offer with supplier info
                 valid_offer = Offer(
                     **offer_data,
                     supplier_name=supplier.name,
@@ -125,7 +152,6 @@ def negotiate_with_suppliers(client: httpx.Client, suppliers: List[SupplierInfo]
                 print(f"SUCCESS: {supplier.name} offered {valid_offer.price} {valid_offer.currency}")
 
             elif response_data.get("rejections"):
-                # Supplier rejected the intent
                 rejection_msg = response_data["rejections"][0]["message"]
                 print(f"REJECTED: {supplier.name} rejected intent. Reason: {rejection_msg}")
 
@@ -145,7 +171,8 @@ def negotiate_with_suppliers(client: httpx.Client, suppliers: List[SupplierInfo]
 
 def select_and_commit_best_offer(client: httpx.Client, offers: List[Offer], original_tx_id: str):
     """
-    v0.5: Selects the best offer (cheapest) and commits to it.
+    v0.6: No changes required to this function.
+    It selects the best offer from the (now trusted) list.
     """
     print(f"--- 3. COMMITMENT PHASE ---")
 
@@ -155,7 +182,6 @@ def select_and_commit_best_offer(client: httpx.Client, offers: List[Offer], orig
         return
 
     # --- Selection Logic ---
-    # Sort offers by price, from cheapest to most expensive
     offers.sort(key=lambda o: o.price)
     best_offer = offers[0]
 
@@ -164,7 +190,7 @@ def select_and_commit_best_offer(client: httpx.Client, offers: List[Offer], orig
 
     # --- Commit Logic ---
     commit_payload = {
-        "transactionId": original_tx_id,  # Use a consistent transaction ID
+        "transactionId": original_tx_id,
         "offerId": best_offer.offerId
     }
 
@@ -181,7 +207,7 @@ def select_and_commit_best_offer(client: httpx.Client, offers: List[Offer], orig
         print(f"--- COMMIT RESPONSE RECEIVED (Code: {commit_response.status_code}) ---")
         print(f"{json.dumps(commit_data, indent=2)}\n")
 
-        print(f"--- v0.5 FULL FLOW COMPLETE ---")
+        print(f"--- v0.6 FULL FLOW COMPLETE ---")
         print(f"STATUS: {commit_data.get('status')}")
         print(f"Confirmation ID: {commit_data.get('confirmationId')}")
         print(f"Message: {commit_data.get('message')}")
@@ -198,17 +224,15 @@ def select_and_commit_best_offer(client: httpx.Client, offers: List[Offer], orig
 
 def main():
     """
-    Main function to run the v0.5 Agent Client.
-    1. Discover ALL suppliers.
-    2. Negotiate with ALL of them.
+    Main function to run the v0.6 Agent Client.
+    1. Securely Discover ALL *verified* suppliers.
+    2. Negotiate with them.
     3. Select the BEST offer and commit.
     """
 
-    # This is the "base" intent for this shopping trip
-    # We will send this to all suppliers
     shopping_intent = {
-        "transactionId": f"tx-main-{uuid.uuid4()}",  # Base ID
-        "requesterId": "urn:ac:my-dev-client:test:005",
+        "transactionId": f"tx-main-{uuid.uuid4()}",
+        "requesterId": "urn:ac:my-dev-client:test:006",
         "serviceType": "booking:flight",
         "intent": {
             "params": {
@@ -217,14 +241,16 @@ def main():
                 "date": "2025-11-15"
             },
             "constraints": {
-                "maxPrice": 500,  # Our budget is 500
+                "maxPrice": 500,
                 "currency": "EUR"
             }
         }
     }
 
+    # v0.6: We initialize the client just once. No changes here.
     with httpx.Client() as client:
         # 1. Discover
+        # This function is now secure and filters for trust
         suppliers = discover_suppliers(client, SERVICE_TO_FIND)
 
         if not suppliers:
@@ -232,15 +258,15 @@ def main():
             sys.exit(1)
 
         # 2. Negotiate
+        # This function doesn't need to change
         all_offers = negotiate_with_suppliers(client, suppliers, shopping_intent)
 
         # 3. Commit
+        # This function doesn't need to change
         select_and_commit_best_offer(client, all_offers, shopping_intent["transactionId"])
 
 
 # --- Run the Script ---
 if __name__ == "__main__":
-    import uuid
-
     main()
 
