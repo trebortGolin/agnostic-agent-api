@@ -33,23 +33,29 @@ class DiscoveryResponse(BaseModel):
 
 
 # --- In-Memory "Database" of Registered Suppliers ---
-# This is our core commercial asset.
-# In a real app, this would be a massive, scalable database.
+# v0.5 Update: We now have two suppliers for 'booking:flight'
 REGISTERED_SUPPLIERS = {
     "urn:as:flight-supplier-demo:001": SupplierInfo(
         supplierId="urn:as:flight-supplier-demo:001",
         name="Demo Flight Supplier (AS)",
-        baseUrl="http://127.0.0.1:8000",
+        baseUrl="http://127.0.0.1:8000", # Port 8000
         supportedServices=["booking:flight", "booking:hotel"]
     ),
     "urn:as:weather-supplier-demo:002": SupplierInfo(
         supplierId="urn:as:weather-supplier-demo:002",
         name="Demo Weather Supplier",
-        baseUrl="http://127.0.0.1:8002",  # Note: a different server
+        baseUrl="http://127.0.0.1:8002",
         supportedServices=["weather:forecast"]
     ),
+    # --- NEW SUPPLIER ADDED FOR v0.5 ---
+    "urn:as:airdemo-competitor:003": SupplierInfo(
+        supplierId="urn:as:airdemo-competitor:003",
+        name="AirDemo (Competitor)",
+        baseUrl="http://127.0.0.1:8003", # Port 8003
+        supportedServices=["booking:flight"] # Also supports our service
+    ),
+    # ------------------------------------
 }
-
 
 # --- Endpoint 1: Discovery (/discover) ---
 
