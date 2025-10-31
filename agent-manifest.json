@@ -1,0 +1,46 @@
+{
+  "schema_version": "v1.0",
+  "display_name": "Agnostic Travel Specialist",
+  "namespace": "atp_travel_agent",
+  "description": "A specialist agent that can search and book flights and hotels. This is a reference implementation of the Agnostic Agent Protocol.",
+  "api_endpoint": "https://your-production-url.com/api",
+  "authentication": {
+    "type": "Bearer",
+    "instructions": "The Bearer token must be provided in the 'Authorization' header for all 'BOOK_' tasks."
+  },
+  "capabilities": [
+    {
+      "intent": "SEARCH_FLIGHT",
+      "description": "Searches for one-way flights.",
+      "parameters": [
+        {"name": "origin", "type": "string", "required": true},
+        {"name": "destination", "type": "string", "required": true},
+        {"name": "departure_date", "type": "string", "format": "YYYY-MM-DD", "required": true}
+      ],
+      "task_name": "GOOGLE_SEARCH_FLIGHT",
+      "secure": false
+    },
+    {
+      "intent": "SEARCH_HOTEL",
+      "description": "Searches for hotels in a location.",
+      "parameters": [
+        {"name": "location", "type": "string", "required": true},
+        {"name": "check_in_date", "type": "string", "format": "YYYY-MM-DD", "required": true},
+        {"name": "check_out_date", "type": "string", "format": "YYYY-MM-DD", "required": true}
+      ],
+      "task_name": "GOOGLE_SEARCH_HOTEL",
+      "secure": false
+    },
+    {
+      "intent": "BOOK_ITEM",
+      "description": "Books a previously found flight or hotel item.",
+      "parameters": [
+        {"name": "item_id", "type": "string", "required": true, "context": "booking_context.item_to_book.id"},
+        {"name": "price", "type": "number", "required": true, "context": "booking_context.item_to_book.price"}
+      ],
+      "task_name": "BOOK_FLIGHT | BOOK_HOTEL",
+      "secure": true
+    }
+  ]
+}
+
