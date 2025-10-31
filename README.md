@@ -1,16 +1,138 @@
-Agnostic AI Agent Specialist Architecture (v3.0)1. Vision: The Agnostic Service Layer for the "Internet of Agents"This project provides a robust, production-ready architecture for a Specialist Agent. It is designed to be the trusted, interoperable service layer for the emerging "Internet of Agents."Its purpose is to connect any AI Orchestrator (e.g., Apple Intelligence, AutoGPT, a website chatbot) with any specialized, secure backend service.Core PrinciplesModel-Agnostic: The "Brain" (agent_client.py) is modular. This reference implementation uses Google's Gemini for NLU/NLG, but it can be swapped out to use OpenAI (ChatGPT), Anthropic (Claude), Mistral, or any other model without changing the core infrastructure.Domain-Agnostic: The Travel Agent (handling SEARCH_FLIGHT, BOOK_ITEM) is only an example. This architecture is a generic protocol designed to handle any intent, such as ORDER_PIZZA, SCHEDULE_MEETING, or QUERY_DATABASE.2. Architecture: Brain vs. TransportThe architecture strictly separates the AI logic ("The Brain") from the API and security logic ("The Transport").agent_client.py (The Brain / The Specialist)Contains all AI logic: Natural Language Understanding (NLU) and Natural Language Generation (NLG).Manages conversational state (conversation_state) and multi-turn dialogue (slot-filling).This is the only component that knows about a specific AI model (e.g., import google.generativeai).orchestrator.py (The Transport / The API Server)A production-ready Flask API server (v2.4) with logging.Completely agnostic to the AI model. Its only job is to route requests.Manages Security: Injects authentication tokens (e.g., Authorization: Bearer ...) into secure tasks.Handles Error Simulation for robust testing.agent-manifest.json (The Public Contract)The "menu" or "business card" for your agent.It tells external orchestrators what capabilities (intents) this agent supports.3. The Agnostic Protocol (The JSON Contract)Any external orchestrator can communicate with this agent by following this simple, two-endpoint protocol.Endpoint 1: /chat_turn (The Conversation)This endpoint drives the conversation. It takes the user's input and decides what to do next.Method: POSTPurpose: NLU & Core Logic.Returns: Either a text response (for clarification) OR a task to be executed.Body:{
+Agnostic AI Agent Specialist Architecture (v3.0)
+
+1. Vision: The Agnostic Service Layer for the "Internet of Agents"
+
+This project provides a robust, production-ready architecture for a Specialist Agent. It is designed to be the trusted, interoperable service layer for the emerging "Internet of Agents."
+
+Its purpose is to connect any AI Orchestrator (e.g., Apple Intelligence, AutoGPT, a website chatbot) with any specialized, secure backend service.
+
+Core Principles
+
+Model-Agnostic: The "Brain" (agent_client.py) is modular. This reference implementation uses Google's Gemini for NLU/NLG, but it can be swapped out to use OpenAI (ChatGPT), Anthropic (Claude), Mistral, or any other model without changing the core infrastructure.
+
+Domain-Agnostic: The Travel Agent (handling SEARCH_FLIGHT, BOOK_ITEM) is only an example. This architecture is a generic protocol designed to handle any intent, such as ORDER_PIZZA, SCHEDULE_MEETING, or QUERY_DATABASE.
+
+2. Architecture: Brain vs. Transport
+
+The architecture strictly separates the AI logic ("The Brain") from the API and security logic ("The Transport").
+
+agent_client.py (The Brain / The Specialist)
+
+Contains all AI logic: Natural Language Understanding (NLU) and Natural Language Generation (NLG).
+
+Manages conversational state (conversation_state) and multi-turn dialogue (slot-filling).
+
+This is the only component that knows about a specific AI model (e.g., import google.generativeai).
+
+orchestrator.py (The Transport / The API Server)
+
+A production-ready Flask API server (v2.4) with logging.
+
+Completely agnostic to the AI model. Its only job is to route requests.
+
+Manages Security: Injects authentication tokens (e.g., Authorization: Bearer ...) into secure tasks.
+
+Handles Error Simulation for robust testing.
+
+agent-manifest.json (The Public Contract)
+
+The "menu" or "business card" for your agent.
+
+It tells external orchestrators what capabilities (intents) this agent supports.
+
+3. The Agnostic Protocol (The JSON Contract)
+
+Any external orchestrator can communicate with this agent by following this simple, two-endpoint protocol.
+
+Endpoint 1: /chat_turn (The Conversation)
+
+This endpoint drives the conversation. It takes the user's input and decides what to do next.
+
+Method: POST
+
+Purpose: NLU & Core Logic.
+
+Returns: Either a text response (for clarification) OR a task to be executed.
+
+Body:
+
+{
   "user_input": "Yes, book it for me.",
   "conversation_state": { ... }
 }
-Endpoint 2: /generate_response (The Follow-up)This endpoint is called after the external orchestrator executes a task. It generates the final human-readable response.Method: POSTPurpose: NLG.Returns: The final text response.Body:{
+
+
+Endpoint 2: /generate_response (The Follow-up)
+
+This endpoint is called after the external orchestrator executes a task. It generates the final human-readable response.
+
+Method: POST
+
+Purpose: NLG.
+
+Returns: The final text response.
+
+Body:
+
+{
   "task_results": { "status": "BOOKING_CONFIRMED", ... },
   "user_prompt": "Yes, book it for me.",
   "conversation_state": { ... }
 }
-4. Key FeaturesSecurity: The orchestrator handles auth_token injection for secure tasks (e.g., BOOK_FLIGHT).Robust Error Handling: The Brain (agent_client.py) can gracefully handle tool failures from the orchestrator (e.g., {"error": "NO_RESULTS"} or {"error": "SERVICE_ERROR"}).Stateful Memory: The conversation_state object is passed back and forth, allowing for complex, multi-turn dialogues.5. Example Implementation (The Travel Agent)This repository provides a reference implementation for a Travel Agent with the following intents:SEARCH_FLIGHTSEARCH_HOTELBOOK_ITEM (Secure Task)How to Add a New Domain (e.g., E-commerce)To prove this architecture is generic, adding a new "E-commerce" capability is simple:Update the Brain (agent_client.py):Add SEARCH_PRODUCT to the NLU_SYSTEM_PROMPT.Add logic to core_processing_phase to generate a task for Google Search_PRODUCT.Update the Contract (agent-manifest.json):Add the new SEARCH_PRODUCT capability to the manifest so external orchestrators can discover it.The orchestrator.py API server requires zero changes.6. Getting Started (Deployment)Install Dependencies:pip install -r requirements.txt 
+
+
+4. Key Features
+
+Security: The orchestrator handles auth_token injection for secure tasks (e.g., BOOK_FLIGHT).
+
+Robust Error Handling: The Brain (agent_client.py) can gracefully handle tool failures from the orchestrator (e.g., {"error": "NO_RESULTS"} or {"error": "SERVICE_ERROR"}).
+
+Stateful Memory: The conversation_state object is passed back and forth, allowing for complex, multi-turn dialogues.
+
+5. Example Implementation (The Travel Agent)
+
+This repository provides a reference implementation for a Travel Agent with the following intents:
+
+SEARCH_FLIGHT
+
+SEARCH_HOTEL
+
+BOOK_ITEM (Secure Task)
+
+How to Add a New Domain (e.g., E-commerce)
+
+To prove this architecture is generic, adding a new "E-commerce" capability is simple:
+
+Update the Brain (agent_client.py):
+
+Add SEARCH_PRODUCT to the NLU_SYSTEM_PROMPT.
+
+Add logic to core_processing_phase to generate a task for Google Search_PRODUCT.
+
+Update the Contract (agent-manifest.json):
+
+Add the new SEARCH_PRODUCT capability to the manifest so external orchestrators can discover it.
+
+The orchestrator.py API server requires zero changes.
+
+6. Getting Started (Deployment)
+
+Install Dependencies:
+
+pip install -r requirements.txt 
 # (Assuming Flask & google-generativeai are listed)
-Set Environment Variables:source venv/bin/activate
+
+
+Set Environment Variables:
+
+source venv/bin/activate
 export GEMINI_API_KEY="YOUR_VALID_API_KEY"
 export PYTHONIOENCODING=UTF-8
-Run the API Server:python orchestrator.py
+
+
+Run the API Server:
+
+python orchestrator.py
+
+
 Agent is now live and listening on http://127.0.0.1:5000.
