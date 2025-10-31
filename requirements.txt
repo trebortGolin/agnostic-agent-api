@@ -1,1 +1,4 @@
-google-generativeai
+Python dependencies for the Agnostic Agent (v3.0)
+
+Flask==3.0.3
+google-generativeai==0.7.1
