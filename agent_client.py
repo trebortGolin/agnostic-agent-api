@@ -1,8 +1,6 @@
-# --- AGENT CLIENT (AC) v1.0 (LLM-Powered) ---
-# Ce client simule un agent conversationnel capable de comprendre
-# une demande de vol, d'appeler une API (simulée) et de générer une réponse.
-# v1.0: Introduction d'une boucle de conversation et d'une mémoire (state)
-#       pour permettre le "slot-filling" (complétion des informations).
+# --- AGENT CLIENT (AC) v2.1 (Error Handling) ---
+# This client handles the core conversation logic (NLU, NLG, Memory).
+# v2.1: Updated NLG to handle external service failures gracefully (e.g., API down).
 
 import google.generativeai as genai
 import json
@@ -12,53 +10,74 @@ import re
 # --- 1. CONFIGURATION ---
 try:
     GOOGLE_API_KEY = os.environ.get("GEMINI_API_KEY")
+
     if not GOOGLE_API_KEY:
-        raise ValueError("La variable d'environnement GEMINI_API_KEY n'est pas définie.")
+        raise ValueError("The GEMINI_API_KEY environment variable is not set.")
 
     genai.configure(api_key=GOOGLE_API_KEY)
 except Exception as e:
-    print(f"--- ERREUR DE CONFIGURATION ---")
-    print(f"Erreur: {e}")
-    print("Veuillez définir votre GEMINI_API_KEY avant de lancer le script.")
-    print("Exemple: export GEMINI_API_KEY=\"votre_cle_ici\"")
+    print(f"--- CONFIGURATION ERROR ---")
+    print(f"Error: {e}")
+    print("Please set your GEMINI_API_KEY before running the script.")
+    print("Example: export GEMINI_API_KEY=\"your_key_here\"")
     exit()
 
-# --- v1.0: DEUX CERVEAUX (NLU et NLG) ---
+# --- v2.1: TWO BRAINS (NLU and NLG) ---
 
-# --- CERVEAU NLU (Phase 0) ---
-# Le prompt NLU est mis à jour pour gérer le contexte (l'état précédent)
+# --- NLU BRAIN (Phase 0) ---
 NLU_SYSTEM_PROMPT = """
-Tu es un agent NLU (Natural Language Understanding) expert pour une compagnie aérienne.
-Ta seule tâche est de mettre à jour un objet JSON basé sur la demande de l'utilisateur.
-Ne réponds RIEN d'autre que le JSON final.
+You are an expert NLU (Natural Language Understanding) agent for a travel agency.
+Your sole task is to update a JSON object based on the user's request.
+Respond with NOTHING but the final JSON.
 
-Tu recevras:
-1.  "État JSON précédent": L'état de la conversation (peut être vide {}).
-2.  "Demande utilisateur actuelle": Ce que l'utilisateur vient de dire.
+You will receive:
+1.  "Previous JSON State": The state of the conversation (can be empty {}).
+2.  "Current User Request": What the user just said.
 
-Tes règles:
-- Si la demande utilisateur est une *nouvelle* recherche (ex: "Je veux un vol pour NY"),
-  ignore l'état précédent et crée un NOUVEAU JSON complet.
-- Si la demande utilisateur est une *réponse* (ex: "De Paris", ou "le 15 décembre"),
-  UTILISE l'état JSON précédent et AJOUTE ou MODIFIE seulement les informations
-  fournies (ex: "origin": "Paris").
-- Reporte toujours les informations de l'état précédent si elles ne sont pas
-  modifiées par l'utilisateur.
-- Si l'utilisateur change d'avis (ex: "finalement je veux aller à Londres"),
-  mets à jour la destination.
+Your rules:
+- Identify the user's intent: 'SEARCH_FLIGHT', 'SEARCH_HOTEL', 'BOOK_ITEM', or 'CLARIFICATION'.
+- If the request is a *new* search (e.g., "Find me a hotel in Paris"),
+  ignore the previous state and create a NEW, complete JSON for this intent.
+- If the user request is a *response* (e.g., "From Paris", "on Dec 15th"),
+  USE the previous JSON state and ONLY ADD or MODIFY the information provided. The intent should be 'CLARIFICATION' or the one from the previous state.
+- If the user confirms a booking (e.g., "yes", "book it", "that's perfect, confirm"),
+  detect the 'BOOK_ITEM' intent.
+- Always report the booking_context from the previous state.
 
-L'objet JSON doit toujours avoir cette structure :
+Output JSON Structure:
 {
-  "intent": "SEARCH_FLIGHT",
-  "entities": {
-    "origin": "VILLE_OU_CODE_IATA" (ou null),
-    "destination": "VILLE_OU_CODE_IATA" (ou null),
-    "departure_date": "YYYY-MM-DD" (ou null),
-    "return_date": "YYYY-MM-DD" (ou null),
-    "max_price": INT (ou null),
-    "currency": "EUR" (ou "USD", "CAD", etc. ou null)
+  "intent": "SEARCH_FLIGHT" | "SEARCH_HOTEL" | "BOOK_ITEM" | "CLARIFICATION",
+  "parameters": {
+    // Common entities
+    "location": "CITY" (or null),
+    "departure_date": "YYYY-MM-DD" (or null),
+    "max_price": INT (or null),
+    "currency": "EUR" (or "USD", "CAD", etc. or null),
+
+    // Flight-specific entities
+    "origin": "CITY_OR_IATA_CODE" (or null),
+    "destination": "CITY_OR_IATA_CODE" (or null),
+    "return_date": "YYYY-MM-DD" (or null),
+
+    // Hotel-specific entities
+    "check_in_date": "YYYY-MM-DD" (or null),
+    "check_out_date": "YYYY-MM-DD" (or null),
+    "guests": INT (or null)
+  },
+  "booking_context": {
+    "item_to_book": { "type": "flight" | "hotel" | null, "id": "ITEM_ID", "price": 123.45 },
+    "is_confirmed": false
   }
 }
+
+Example 1 (New Flight Search):
+  User Request: "I want a flight from Paris to New York on Nov 15, 2025"
+  Output JSON:
+  {
+    "intent": "SEARCH_FLIGHT",
+    "parameters": { "origin": "Paris", "destination": "New York", "departure_date": "2025-11-15", ... },
+    "booking_context": { "item_to_book": null, "is_confirmed": false }
+  }
 """
 
 nlu_generation_config = {
@@ -70,29 +89,37 @@ nlu_generation_config = {
 
 MODEL_NAME_TO_USE = "gemini-2.5-flash"
 
-# Initialisation du modèle NLU
+# NLU Model Initialization
 llm_nlu = genai.GenerativeModel(
     model_name=MODEL_NAME_TO_USE,
     generation_config=nlu_generation_config,
     system_instruction=NLU_SYSTEM_PROMPT
 )
 
-# --- CERVEAU NLG (Phase 2) ---
+# --- NLG BRAIN (Phase 2) ---
+# MODIFIED v2.1: Now handles task failure messages in task_results
 NLG_SYSTEM_PROMPT = """
-Tu es un agent de voyage conversationnel, amical et serviable.
-Ta tâche est de répondre à la demande de l'utilisateur en te basant sur les données de vol trouvées (au format JSON).
+You are a conversational, friendly, and helpful travel agent.
+Your task is to respond to the user based on the context provided.
 
-- Sois toujours amical et utilise un ton naturel.
-- Si un vol est trouvé (`flight_data` n'est pas vide):
-    - Présente les détails du vol (compagnie, prix).
-    - NE mentionne PAS l'ID du vol (ex: "AF006"), c'est interne. Dis juste "un vol Air France".
-    - Si le prix du vol est supérieur au `max_price` de l'utilisateur, signale-le poliment.
-- Si aucun vol n'est trouvé (`flight_data` est "null" MAIS les entités sont complètes):
-    - Informe poliment l'utilisateur qu'aucun vol ne correspond.
-- Si la demande initiale était trop vague ou incomplète (`flight_data` est "null"
-  ET certaines entités dans `conversation_state` sont "null"):
-    - Regarde `conversation_state` pour voir ce qui manque (origin, destination, ou departure_date).
-    - Demande gentiment *une seule* information manquante à la fois. (Ex: "D'où partez-vous ?")
+- Always be friendly and use a natural, engaging tone.
+- If the conversation state is incomplete, politely ask for the missing single piece of information.
+
+- If 'task_results' contains an error (e.g., {"error": "NO_RESULTS"}):
+    - Acknowledge the search but apologize for the lack of results.
+    - If the error is 'NO_RESULTS', suggest searching again with a slightly different query or date.
+    - If the error is 'SERVICE_ERROR', apologize and suggest retrying later or choosing an alternative service.
+
+- If 'task_results' contains successful results (e.g., flight at 650 EUR):
+    - Present the best result clearly.
+    - ALWAYS finish by asking a confirmation question to book it.
+    - (Example: "I found an Air France flight for 650€. Would you like me to book it?")
+
+- If a booking was just confirmed (task_results status is "BOOKING_CONFIRMED"):
+    - Confirm the booking to the user and include the confirmation code.
+    - (Example: "It's done! Your flight to Montreal is confirmed. Your code is XYZ123.")
+
+Your response should be based on the provided context, focusing on being proactive and helpful.
 """
 
 nlg_generation_config = {
@@ -102,7 +129,7 @@ nlg_generation_config = {
     "max_output_tokens": 2048,
 }
 
-# Initialisation du modèle NLG
+# NLG Model Initialization
 llm_nlg = genai.GenerativeModel(
     model_name=MODEL_NAME_TO_USE,
     generation_config=nlg_generation_config,
@@ -110,12 +137,11 @@ llm_nlg = genai.GenerativeModel(
 )
 
 
-# --- 2. FONCTIONS DE L'AGENT ---
+# --- 2. AGENT FUNCTIONS ---
 
 def clean_json_string(s):
     """
-    Nettoie la sortie brute du LLM pour ne garder que le JSON valide.
-    Enlève les ```json ... ``` et autres textes parasites.
+    Cleans the raw LLM output to keep only the valid JSON.
     """
     start_index = s.find('{')
     end_index = s.rfind('}')
@@ -123,183 +149,219 @@ def clean_json_string(s):
     if start_index != -1 and end_index != -1 and end_index > start_index:
         return s[start_index:end_index + 1]
 
-    print(f"--- AVERTISSEMENT NLU: Impossible de nettoyer le JSON ---")
-    print(f"Réponse brute: {s}")
+    print(f"--- NLU WARNING: Could not clean JSON ---")
+    print(f"Raw Response: {s}")
     return None
 
 
 def nlu_phase_llm(user_prompt, previous_state):
     """
-    Phase 0: NLU (Natural Language Understanding) - v1.0
-    Utilise le LLM pour *mettre à jour* l'état de la conversation.
+    Phase 0: NLU (Natural Language Understanding) - v2.1
+    Uses the LLM to *update* the conversation state.
     """
-    print("--- 0. NLU PHASE (v1.0 Conversational Brain) ---")
+    print("--- 0. NLU PHASE (v2.1 NLU Brain) ---")
     print(f"User prompt: \"{user_prompt}\"")
-    print(f"--- DÉBOGAGE: Tentative d'utilisation du modèle NLU: '{MODEL_NAME_TO_USE}' ---")
 
-    # Prépare le contexte pour le NLU, incluant l'état précédent
+    # Prepare the context for the NLU
     nlu_context = f"""
-    État JSON précédent:
+    Previous JSON State:
     {json.dumps(previous_state, indent=2)}
 
-    Demande utilisateur actuelle:
+    Current User Request:
     "{user_prompt}"
 
-    JSON mis à jour:
+    Updated JSON:
     """
 
-    print("Contacting Gemini API to parse and update intent...")
+    print(f"Contacting Gemini API (NLU) with model '{MODEL_NAME_TO_USE}'...")
 
     try:
-        # Utilise le modèle NLU
         response = llm_nlu.generate_content(nlu_context)
         raw_text = response.text
-
     except Exception as e:
-        print(f"\n--- ERREUR INATTENDUE pendant la phase NLU ---")
-        print(f"Erreur: {e}")
-        print("Vérifiez votre clé API, votre connexion et la configuration du modèle.")
-        return previous_state  # Renvoie l'ancien état en cas d'erreur
+        print(f"\n--- UNEXPECTED ERROR during NLU Phase ---")
+        print(f"Error: {e}")
+        return previous_state
 
-    # Nettoyage et parsing du JSON
     json_string = clean_json_string(raw_text)
     if not json_string:
-        print(f"--- ERREUR NLU: Réponse non JSON ou malformée reçue ---")
-        print(f"Réponse brute: {raw_text}")
-        return previous_state  # Renvoie l'ancien état
+        print(f"--- NLU ERROR: Non-JSON or malformed response received ---")
+        print(f"Raw Response: {raw_text}")
+        return previous_state
 
     try:
         updated_state = json.loads(json_string)
-        print("Intent mis à jour avec succès:")
+
+        # v2.1: Persistence logic for the booking context
+        # If the NLU forgot to report 'item_to_book' from the previous state, report it manually.
+        if previous_state.get("booking_context", {}).get("item_to_book") and \
+                not updated_state.get("booking_context", {}).get("item_to_book") and \
+                updated_state.get("intent") != "BOOK_ITEM":  # Unless the intent is to book
+            print("--- INFO: Manually reporting 'item_to_book' in state.")
+            if "booking_context" not in updated_state:
+                updated_state["booking_context"] = {}
+            updated_state["booking_context"]["item_to_book"] = previous_state["booking_context"]["item_to_book"]
+
+        print("Intent successfully updated:")
         print(json.dumps(updated_state, indent=2))
         return updated_state
     except json.JSONDecodeError:
-        print(f"--- ERREUR NLU: JSON invalide après nettoyage ---")
-        print(f"JSON nettoyé (tentative): {json_string}")
-        return previous_state  # Renvoie l'ancien état
+        print(f"--- NLU ERROR: Invalid JSON after cleanup ---")
+        print(f"Cleaned JSON (attempt): {json_string}")
+        return previous_state
 
 
 def core_processing_phase(conversation_state):
     """
-    Phase 1: Core Processing (Simulation) - v1.0
-    Tente d'appeler l'API *seulement si* les informations requises sont présentes.
+    Phase 1: Core Processing (Task Preparation) - v2.1
+    Prepares the task (Flight, Hotel, or Booking).
     """
-    print("\n--- 1. CORE PROCESSING PHASE (Simulation) ---")
+    print("\n--- 1. CORE PROCESSING PHASE (Task Prep) ---")
 
-    if not conversation_state or conversation_state.get("intent") != "SEARCH_FLIGHT":
-        print("Erreur: Intent non valide ou non reconnu.")
+    if not conversation_state or "intent" not in conversation_state:
+        print("Error: Invalid or unrecognized intent.")
         return None
 
-    entities = conversation_state.get("entities", {})
-    origin = entities.get("origin")
-    destination = entities.get("destination")
-    date = entities.get("departure_date")
+    intent = conversation_state.get("intent")
+    params = conversation_state.get("parameters", {})
+    booking_context = conversation_state.get("booking_context", {})
 
-    # Vérification cruciale : n'appelle l'API que si nous avons les 3 infos clés
-    if not all([origin, destination, date]):
-        print("Entités requises (origine, destination, date) manquantes.")
-        print("Saut de l'appel API. La phase NLG demandera des clarifications.")
-        return None
+    task_to_perform = None
 
-    print(f"Appel (simulé) de l'API de vol pour: {origin} -> {destination} le {date}")
+    # Routing logic based on intent
+    if intent == "SEARCH_FLIGHT":
+        origin = params.get("origin")
+        destination = params.get("destination")
+        date = params.get("departure_date")
 
-    # --- SCÉNARIOS DE SIMULATION ---
-    user_max_price = entities.get("max_price")
+        if not all([origin, destination, date]):
+            print("Required entities (Flight) missing. Requesting clarification.")
+            return None  # No task, NLG will ask
 
-    if user_max_price and user_max_price < 500:
-        print("Réponse (simulée): Vol trouvé, mais supérieur au budget.")
-        return {
-            "flight_id": "AF012", "airline": "Air France",
-            "origin": origin, "destination": destination,
-            "departure_time": f"{date}T10:00:00", "arrival_time": f"{date}T13:00:00",
-            "price": 550.00,
-            "currency": entities.get("currency", "EUR")
+        search_query = f"price flight {origin} to {destination} on {date}"
+
+        print(f"Preparing task (Flight) with query: '{search_query}'")
+        task_to_perform = {
+            "task_name": "GOOGLE_SEARCH_FLIGHT",
+            "query": search_query
         }
 
-    print("Réponse (simulée): Vol trouvé, prix OK.")
-    return {
-        "flight_id": "AF006", "airline": "Air France",
-        "origin": origin, "destination": destination,
-        "departure_time": f"{date}T09:00:00", "arrival_time": f"{date}T12:00:00",
-        "price": 489.99,
-        "currency": entities.get("currency", "EUR")
-    }
+    elif intent == "SEARCH_HOTEL":
+        location = params.get("location")
+        check_in = params.get("check_in_date")
+        check_out = params.get("check_out_date")
+
+        if not all([location, check_in, check_out]):
+            print("Required entities (Hotel) missing. Requesting clarification.")
+            return None  # No task, NLG will ask
+
+        search_query = f"price hotel {location} from {check_in} to {check_out}"
+
+        print(f"Preparing task (Hotel) with query: '{search_query}'")
+        task_to_perform = {
+            "task_name": "GOOGLE_SEARCH_HOTEL",
+            "query": search_query
+        }
+
+    # Handle booking intent
+    elif intent == "BOOK_ITEM":
+        item = booking_context.get("item_to_book")
+        is_confirmed = booking_context.get("is_confirmed", False)
+
+        if item and is_confirmed:
+            print(f"Preparing task (Booking) for item: {item.get('id')}")
+            task_to_perform = {
+                "task_name": f"BOOK_{item.get('type').upper()}",  # ex: BOOK_FLIGHT
+                "item_id": item.get("id"),
+                "price": item.get("price")
+            }
+        else:
+            print("Booking intent detected, but item or confirmation is missing.")
+            return None
+
+    elif intent == "CLARIFICATION":
+        print("Clarification intent. No task to execute.")
+        return None
+
+    else:
+        print(f"Intent '{intent}' not handled by Core Processing.")
+        return None
+
+    return task_to_perform
 
 
-def generation_phase_llm(flight_data, user_prompt, conversation_state):
+def generation_phase_llm(task_results, user_prompt, conversation_state):
     """
-    Phase 2: Generation (NLG - Natural Language Generation) - v1.0
-    Utilise le LLM (Gemini) pour générer une réponse naturelle basée sur l'état.
+    Phase 2: Generation (NLG - Natural Language Generation) - v2.1
+    Generates a response based on the state AND the TASK results.
     """
-    print("\n--- 2. GENERATION PHASE (v1.0 LLM Brain) ---")
+    print("\n--- 2. GENERATION PHASE (v2.1 NLG Brain) ---")
 
-    # 1. Préparer le contexte pour le LLM NLG
+    # 1. Prepare the context for the NLG LLM
     context = f"""
-    Demande originale de l'utilisateur: "{user_prompt}"
+    Original User Prompt: "{user_prompt}"
 
-    État actuel de la conversation (JSON parsé par le NLU):
+    Current Conversation State (JSON parsed by NLU):
     {json.dumps(conversation_state, indent=2)}
 
-    Données de vol trouvées (résultat de l'API Core):
-    {json.dumps(flight_data, indent=2) if flight_data else "null"}
+    Task Results (provided by external tool):
+    {json.dumps(task_results, indent=2) if task_results else "null"}
 
-    Ta réponse:
+    Your Response:
     """
 
-    print(f"--- DÉBOGAGE: Tentative d'utilisation du modèle NLG: '{MODEL_NAME_TO_USE}' ---")
-    print("Contacting Gemini API to generate response...")
+    print(f"Contacting Gemini API (NLG) with model '{MODEL_NAME_TO_USE}'...")
 
     try:
-        # 2. Appeler le modèle NLG
         response = llm_nlg.generate_content(context)
         final_response = response.text
-
-        print("Réponse générée avec succès.")
+        print("Response successfully generated.")
         return final_response
 
     except Exception as e:
-        print(f"\n--- ERREUR INATTENDUE pendant la phase NLG ---")
-        print(f"Erreur: {e}")
-        return "Je suis désolé, une erreur interne est survenue lors de la génération de ma réponse."
+        print(f"\n--- UNEXPECTED ERROR during NLG Phase ---")
+        print(f"Error: {e}")
+        return "I'm sorry, an internal error occurred while generating my response."
 
 
-# --- 3. EXÉCUTION PRINCIPALE ---
+# --- 3. MAIN EXECUTION FUNCTIONS ---
 
-if __name__ == "__main__":
-    print(f"--- AGENT CLIENT (AC) v1.0 (Conversational) STARTED ---")
-    print("Tapez 'quitter' pour arrêter.")
+def initialize_agent():
+    """Called once at startup."""
+    conversation_state = {
+        "intent": "CLARIFICATION",  # Default starting state
+        "parameters": {},
+        "booking_context": {"item_to_book": None, "is_confirmed": False}
+    }
+    return conversation_state
 
-    # Initialisation de la mémoire de conversation
-    conversation_state = {}
 
-    # Boucle de conversation
-    while True:
-        print("\n" + "=" * 50)
-        # 1. Obtenir l'entrée utilisateur
-        user_input = input("Vous: ")
+def run_agent_turn(user_input, current_state):
+    """
+    Executes a single turn of conversation.
+    Returns: (agent_response_text, new_state, task_to_perform_json)
+    """
 
-        if user_input.lower() in ["quitter", "exit", "stop", "bye"]:
-            print("AGENT: Au revoir !")
-            break
+    # Phase 0: NLU (State Update)
+    conversation_state = nlu_phase_llm(user_input, current_state)
 
-        # Phase 0: NLU (Mise à jour de l'état)
-        # L'état est mis à jour à chaque tour
-        conversation_state = nlu_phase_llm(user_input, conversation_state)
+    if not conversation_state:
+        response = "I'm sorry, I could not process that request."
+        return response, current_state, None
 
-        if not conversation_state:
-            print("AGENT: Je suis désolé, je n'ai pas pu traiter cette demande.")
-            # Réinitialiser l'état pour éviter les erreurs
-            conversation_state = {}
-            continue
+        # Phase 1: Core Processing (Task Preparation)
+    task_to_perform = core_processing_phase(conversation_state)
 
-        # Phase 1: Core Processing (Appel API si l'état est complet)
-        flight_results = core_processing_phase(conversation_state)
+    # By default, no results needed
+    task_results = None
 
-        # Phase 2: Génération de la réponse (LLM)
-        final_response = generation_phase_llm(flight_results, user_input, conversation_state)
+    # --- ORCHESTRATOR CHECKPOINT ---
+    if task_to_perform:
+        print("--- TASK REQUIRED CHECKPOINT ---")
+        print(f"Agent requested execution of: {task_to_perform['task_name']}")
+        return None, conversation_state, task_to_perform
 
-        # Résultat final
-        print(f"AGENT: {final_response}")
+    # Phase 2: Generation (if NO task is required)
+    final_response = generation_phase_llm(task_results, user_input, conversation_state)
 
-    print("--- AGENT CLIENT FINISHED ---")
-
+    return final_response, conversation_state, None
