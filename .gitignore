@@ -1,0 +1,22 @@
+Python Virtual Environment
+
+venv/
+
+PyCharm configuration files
+
+.idea/
+
+Python cache files
+
+pycache/
+*.pyc
+
+macOS system files
+
+.DS_Store
+
+--- CRITICAL: Security Keys ---
+
+Ignore all .pem files (private and public keys)
+
+*.pem
