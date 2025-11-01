@@ -1,84 +1,32 @@
-# 🤖 Agnostic AI Agent Specialist Architecture (v3.3 - Zero-Trust)
+amorce (SDK v1.0)Reference implementation (Python / Flask) of the Agnostic Transaction Protocol (ATP).This project provides the v1.0 SDK for the amorce agent, a "Zero-Trust" secure API designed to expose an LLM in a controlled and verifiable manner.ArchitectureThis repository is designed to be deployed as a containerized service (e.g., on Google Cloud Run) using the provided Dockerfile.orchestrator.py: The API layer (Flask). It handles authentication (X-ATP-Key), schema validation, and signature verification. This is the "lock".agent_client.py: The logic layer (the "brain"). It manages business logic, task execution, and calls to the LLM.agent-manifest.json: The agent's public contract, compliant with the ATP specification.Security Model (Zero-Trust)Security is managed at two levels:Authentication (The Lock): The orchestrator blocks any request lacking a valid X-ATP-Key header (via the AGENT_API_KEY variable).Integrity (The Seal): The agent cryptographically signs all its responses (signed_task) using its private key (via the AGENT_PRIVATE_KEY variable). The client can then verify this signature using the public key provided in the /manifest.Quick Start (Local)1. PrerequisitesPython 3.11+ (to match the production Dockerfile)A virtual environment (venv)2. Installation# Clone the repository
+git clone [https://github.com/trebortgolin/amorce.git](https://github.com/trebortgolin/amorce.git)
+cd amorce
 
-## 1. 🎯 Vision: The Agnostic Service Layer for the "Internet of Agents"
+# Create and activate a virtual environment
+python3 -m venv venv
+source venv/bin/activate
 
-This project provides a robust, **production-ready, zero-trust** architecture for a Specialist Agent. It is designed to be the trusted, interoperable service layer for the emerging "Internet of Agents."
+# Install the dependencies
+pip install -r requirements.txt
+3. Configuration (Environment Variables)The application is designed to "fail-fast" and will refuse to start if these variables are not set.Create a .env file at the project root, or export these variables:# .env
 
-Its purpose is to connect any AI Orchestrator (e.g., Apple Intelligence, AutoGPT) with any specialized, secure backend service, guaranteeing **identity** and **integrity**.
+# 1. The API "lock" (used by orchestrator.py)
+# Secret key to authenticate with the API (must be in the X-ATP-Key header)
+AGENT_API_KEY="sk-atp-amorce-dev-..."
 
-### Core Principles
+# 2. The agent "seal" (used by agent_client.py)
+# Path (or content) of the Ed25519 private key used to sign responses.
+AGENT_PRIVATE_KEY="agent_private_key.pem"
 
-* **🔄 Model-Agnostic:** The "Brain" (`agent_client.py`) is modular. This reference implementation uses Google's Gemini, but it can be swapped out to use OpenAI (ChatGPT), Anthropic (Claude), or any other model without changing the core infrastructure.
+# 3. The LLM "brain" (used by agent_client.py)
+# API key for Google Gemini, as our agent_client uses google-generativeai
+GEMINI_API_KEY="AIzaSy..."
+4. Generate Keys (if they don't exist)Ensure you have agent_private_key.pem and agent_public_key.pem files at the root. Our code (agent_client.py) uses the Ed25519 standard (not RSA).# (Generate the Ed25519 private key)
+openssl genpkey -algorithm Ed25519 -out agent_private_key.pem
 
-* **✈️ Domain-Agnostic:** The Travel Agent (handling `SEARCH_FLIGHT`) is only an example. This architecture is a generic protocol for any intent (`ORDER_PIZZA`, `SCHEDULE_MEETING`, etc.).
-
-## 2. 🏗️ Architecture: Brain vs. Transport (v3.0)
-
-The architecture strictly separates the AI logic ("The Brain") from the API and security logic ("The Transport").
-
-### `agent_client.py` (🧠 The Brain / The Specialist)
-
-* Contains all AI logic: Natural Language Understanding (NLU) and Natural Language Generation (NLG).
-* Manages conversational state (`conversation_state`) and multi-turn dialogue (slot-filling).
-* **NEW (v3.0):** Reads a **Private Key** (`AGENT_PRIVATE_KEY`) from environment variables.
-* **NEW (v3.0):** Cryptographically **signs** all outgoing tasks (e.g., `BOOK_FLIGHT`) using Ed25519 to ensure task integrity (prevents non-repudiation).
-
-### `orchestrator.py` (🛡️ The Transport / The API Server)
-
-* A production-ready Flask API server (v3.0) with logging.
-* Completely agnostic to the AI model.
-* **NEW (v3.0):** Implements a **Zero-Trust API Lock**. All endpoints (`/chat_turn`, `/generate_response`, `/manifest`) are **secured** and require a valid `X-ATP-Key` header for access (prevents DoS/abuse).
-* **NEW (v3.0):** Handles **User Authentication**. It extracts the user's `Authorization` header during secure tasks (like `BOOK_ITEM`) and passes it to the Orchestrator.
-
-### `agent-manifest.json` (📜 The Public Contract)
-
-* The "business card" for your agent. It tells external orchestrators what capabilities (intents) this agent supports.
-* **NEW (v3.0):** Now includes a `trust` section containing the **Public Key** and algorithm, allowing any orchestrator to verify the agent's task signatures.
-
-## 3. 🔒 The Zero-Trust Protocol (The JSON Contract)
-
-Any external orchestrator must follow this two-endpoint protocol and respect the new security layers.
-
-### **🔑 Security Layer 1: API Key Authentication (Task 1)**
-
-All requests to *any* endpoint MUST include the secret API key.
-`Header: "X-ATP-Key: sk-atp-xxxxxxxx"`
-
----
-
-### 🗣️ Endpoint 1: `/chat_turn` (The Conversation)
-
-Drives the conversation. Takes user input, decides what to do next.
-
-* **Method:** `POST`
-* **Purpose:** NLU & Core Logic.
-* **Body:**
-    ```json
-    {
-      "user_input": "Yes, book it for me.",
-      "conversation_state": { ... }
-    }
-    ```
-* **NEW (v3.0) Success Response (Task):** Returns the **signed task wrapper**.
-    ```json
-    {
-      "new_state": { ... },
-      "response_text": null,
-      "signed_task": {
-        "task": {
-          "task_name": "BOOK_FLIGHT",
-          "item_id": "AT456",
-          "..." : "..."
-        },
-        "signature": "aV...Zw==",
-        "algorithm": "Ed25519"
-      },
-      "user_auth_token": "Bearer user_token_abc123"
-    }
-    ```
-
----
-
-### 📩 Endpoint 2: `/generate_response` (The Follow-up)
-
-Called *after* the orchestrator executes a task. Generates the final human response
+# (Extract the corresponding public key)
+openssl pkey -in agent_private_key.pem -pubout -out agent_public_key.pem
+(Don't forget to copy the content of agent_public_key.pem into your agent-manifest.json)5. Launch (Local)# Launch the Flask development server (local)
+flask --app orchestrator run --port 5000
+Deployment (Production)This project is designed for containerized deployment. The provided Dockerfile handles the configuration.The command used by the Dockerfile to launch the server in production is:# Command (used in the Dockerfile)
+flask run --host=0.0.0.0 --port=5000

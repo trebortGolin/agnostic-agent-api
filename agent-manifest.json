@@ -3,7 +3,7 @@
   "display_name": "Agnostic Travel Specialist",
   "namespace": "atp_travel_agent",
   "description": "A specialist agent that can search and book flights and hotels. Implements ATP SDK v1.0 Zero-Trust protocol.",
-  "api_endpoint": "https://your-production-url.com",
+  "api_endpoint": "\"api_endpoint\": \"https://api.amorce.io\",",
   "authentication": {
     "type": "API_Key",
     "header_name": "X-ATP-Key",
