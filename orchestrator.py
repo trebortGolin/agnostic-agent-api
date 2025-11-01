@@ -1,12 +1,13 @@
-# --- ORCHESTRATOR (v3.0 - API Key Auth) ---
-# Implements Athena's Briefing Task 1: Zero-Trust API Key Authentication.
-# All endpoints are now locked and require a valid 'X-ATP-Key' header.
+# --- ORCHESTRATOR (v3.1 - Secure + Logging + Fix) ---
+# Merges Athena's v3.0 Zero-Trust security with v2.4 Production Logging.
+# v3.1: Fixes a critical signature integrity flaw. The orchestrator
+#       NO LONGER modifies the signed task payload.
 
 import json
 import agent_client as agent  # Imports our agent brain (v3.0)
 import logging
 import os
-from functools import wraps  # NEW: For creating the auth decorator
+from functools import wraps  # For creating the auth decorator
 
 from flask import Flask, request, jsonify, g
 
@@ -61,7 +62,7 @@ def require_api_key(f):
             logging.warning(f"AUTH_FAILURE: Invalid API Key received: {api_key[:5]}...")
             return jsonify({"error": "Forbidden. Invalid API Key."}), 403
 
-        # Store the authenticated key source for logging (optional)
+        # Store the authenticated key source for logging
         g.auth_source = f"Orchestrator (Key: {api_key[:5]}...)"
         logging.info(f"AUTH_SUCCESS: Valid key received from {g.auth_source}")
 
@@ -150,70 +151,33 @@ def handle_chat_turn():
         # TASK REQUIRED
         logging.info(f"Task detected: {signed_task['task']['task_name']}")
 
-        # Security logic
+        # --- MODIFIED v3.1: Security logic ---
         if signed_task['task']['task_name'].startswith('BOOK_'):
             # The 'auth_token' here is for the *downstream* service (e.g., Amadeus)
             # The 'X-ATP-Key' was for the *upstream* service (Apple -> Us)
-            auth_token = request.headers.get('Authorization')
+            user_auth_token = request.headers.get('Authorization')  # Get the user's token
 
-            if not auth_token:
-                logging.error("Secure task requested but no Auth token provided by orchestrator.")
-                error_response = "This action (booking) requires a user 'Authorization' header. Cannot proceed."
-                return jsonify({"response_text": error_response, "new_state": new_state, "task": None}), 401
-
-            logging.info(f"Secure task, injecting user Auth token: {auth_token[:15]}...")
-            # We inject the user's token *inside* the task payload
-            signed_task['task']['auth_token'] = auth_token
-
-            # We must RE-SIGN the task now that we've modified it
-            # NOTE: In a real-world scenario, you might pass the auth_token
-            # to run_agent_turn to sign it once. For this brief, we re-sign.
-            # This is a placeholder for that re-signing logic if needed.
-            # For Ed25519, we'd need the agent_client to expose the signing function.
-            # For simplicity, we assume the 'auth_token' is not part of the
-            # signature for this reference implementation, or that the orchestrator
-            # adds it as a separate parameter *outside* the signed task.
-
-            # Per Athena's brief, the 'auth_token' for the *booking* is
-            # different from the 'X-ATP-Key'. We will pass the 'Authorization' header
-            # token (for the end-service) into the task, but it won't be part
-            # of the *agent's* signature (which proves the agent's identity).
-
-            # Let's adjust: We'll add it to the *inner* task object,
-            # which means agent_client.py *should* have signed it.
-            # Let's modify agent_client.py's core_processing to handle this.
-
-            # --- Re-evaluation of Brief ---
-            # Brief T2 says agent_client signs the task.
-            # Brief T1 says orchestrator handles auth.
-            # The orchestrator should NOT modify the signed task.
-            # Let's correct the logic: The user's 'Authorization' header
-            # for the *booking* should be passed to the agent_client.
-
-            # This implementation is simpler: We assume the 'Authorization' header
-            # is for the *booking API*, and the 'X-ATP-Key' is for *our* API.
-            # The `agent_client` (v3.0) doesn't know about the booking auth token.
-
-            # Let's follow the simplest path: The `orchestrator.py`
-            # will pass the user's `Authorization` token (for booking)
-            # *outside* the signed task wrapper.
-
-            user_auth_token = request.headers.get('Authorization')
             if not user_auth_token:
                 logging.error("Secure task BOOK_ITEM missing user 'Authorization' header.")
                 error_response = "This action (booking) requires user authentication. Please provide an 'Authorization' header."
                 return jsonify({"response_text": error_response, "new_state": new_state, "task": None}), 401
+
+            # --- FIX v3.1 ---
+            # The bug we found in the previous test is fixed here.
+            # We NO LONGER modify the signed_task.
+            # --- END FIX ---
 
             logging.info(f"Secure task, returning signed task AND user auth token separately.")
 
             return jsonify({
                 "response_text": None,
                 "new_state": new_state,
-                "signed_task": signed_task,  # The agent's signed payload
+                "signed_task": signed_task,  # The agent's *unmodified* signed payload
                 "user_auth_token": user_auth_token  # The user's token for the *next* hop
             })
+        # --- END MODIFIED v3.1 ---
 
-        # Returns the new state and the SIGNED task
+        # Returns the new state and the SIGNED task (for non-secure tasks)
         return jsonify({
             "response_text": None,
             "new_state": new_state,
@@ -243,11 +207,12 @@ def handle_generate_response():
 
     try:
         data = request.json
+        # v3.1 Robustness: Use .get() to avoid KeyErrors
         task_results = data.get('task_results', {})
         user_prompt = data.get('user_prompt')
         conversation_state = data.get('conversation_state')
 
-        # v3.0 Robustness Check
+        # v3.1 Robustness Check
         if not all([task_results is not None, user_prompt, conversation_state is not None]):
             logging.error(
                 f"Incomplete data received: task_results={task_results}, user_prompt={user_prompt}, state_exists={conversation_state is not None}")
@@ -281,8 +246,8 @@ def handle_generate_response():
 
 # --- Main entry point ---
 if __name__ == "__main__":
-    logging.info("ORCHESTRATOR API v3.0 (Zero-Trust) STARTING...")
-    print(f"--- ORCHESTRATOR API v3.0 (Zero-Trust) ---")
+    logging.info("ORCHESTRATOR API v3.1 (Zero-Trust + Fix) STARTING...")
+    print(f"--- ORCHESTRATOR API v3.1 (Zero-Trust + Fix) ---")
     print(f"--- INFO: This server is LOCKED and requires a valid 'X-ATP-Key' header. ---")
     print(f"Your agent is now 'live' on http://127.0.0.1:5000")
     print("Use a tool like Postman or curl to test the endpoints.")
