@@ -1,12 +1,18 @@
 {
-  "schema_version": "v1.0",
+  "schema_version": "v3.0-zt (Zero-Trust)",
   "display_name": "Agnostic Travel Specialist",
   "namespace": "atp_travel_agent",
-  "description": "A specialist agent that can search and book flights and hotels. This is a reference implementation of the Agnostic Agent Protocol.",
-  "api_endpoint": "https://your-production-url.com/api",
+  "description": "A specialist agent that can search and book flights and hotels. Implements ATP SDK v1.0 Zero-Trust protocol.",
+  "api_endpoint": "https://your-production-url.com",
   "authentication": {
-    "type": "Bearer",
-    "instructions": "The Bearer token must be provided in the 'Authorization' header for all 'BOOK_' tasks."
+    "type": "API_Key",
+    "header_name": "X-ATP-Key",
+    "instructions": "The Orchestrator's API Key must be provided in the 'X-ATP-Key' header for all requests."
+  },
+  "trust": {
+    "public_key_format": "PEM",
+    "signature_algorithm": "Ed25519",
+    "public_key": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAFwW4eANJVcRulMHNmo1+KE+H3dJR9HgrFzfLcKX1R8w=\n-----END PUBLIC KEY-----\n"
   },
   "capabilities": [
     {
@@ -18,7 +24,7 @@
         {"name": "departure_date", "type": "string", "format": "YYYY-MM-DD", "required": true}
       ],
       "task_name": "GOOGLE_SEARCH_FLIGHT",
-      "secure": false
+      "secure_task": false
     },
     {
       "intent": "SEARCH_HOTEL",
@@ -29,18 +35,17 @@
         {"name": "check_out_date", "type": "string", "format": "YYYY-MM-DD", "required": true}
       ],
       "task_name": "GOOGLE_SEARCH_HOTEL",
-      "secure": false
+      "secure_task": false
     },
     {
       "intent": "BOOK_ITEM",
-      "description": "Books a previously found flight or hotel item.",
+      "description": "Books a previously found flight or hotel item. Requires user Authorization.",
       "parameters": [
         {"name": "item_id", "type": "string", "required": true, "context": "booking_context.item_to_book.id"},
         {"name": "price", "type": "number", "required": true, "context": "booking_context.item_to_book.price"}
       ],
       "task_name": "BOOK_FLIGHT | BOOK_HOTEL",
-      "secure": true
+      "secure_task": true
     }
   ]
 }
-

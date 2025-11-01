@@ -1,0 +1,16 @@
+Python virtual environment
+
+venv/
+
+Python cache files
+
+pycache/
+*.pyc
+
+IDE configuration files (PyCharm)
+
+.idea/
+
+macOS system files
+
+.DS_Store

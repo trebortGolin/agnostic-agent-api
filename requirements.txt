@@ -1,5 +1,7 @@
-Python dependencies for the Agnostic Agent (v3.0)
+# Python dependencies for the Agnostic Agent (v3.0)
 
 Flask==3.0.3
-
 google-generativeai==0.7.1
+
+# New dependency for Task 2 (Task Signing)
+cryptography==43.0.0

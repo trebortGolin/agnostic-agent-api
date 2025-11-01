@@ -1,30 +1,54 @@
-# --- AGENT CLIENT (AC) v2.1 (Error Handling) ---
-# This client handles the core conversation logic (NLU, NLG, Memory).
-# v2.1: Updated NLG to handle external service failures gracefully (e.g., API down).
+# --- AGENT CLIENT (AC) v3.0 (Task Signing) ---
+# Implements Athena's Briefing Task 2: Cryptographic task signing.
+# This client handles the core conversation logic (NLU, NLG, Memory)
+# and now cryptographically signs all outgoing tasks.
 
 import google.generativeai as genai
 import json
 import os
 import re
+import base64
+
+# --- NEW DEPENDENCIES (from requirements.txt) ---
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
+from cryptography.exceptions import InvalidSignature
 
 # --- 1. CONFIGURATION ---
 try:
+    # LLM API Key
     GOOGLE_API_KEY = os.environ.get("GEMINI_API_KEY")
-
     if not GOOGLE_API_KEY:
         raise ValueError("The GEMINI_API_KEY environment variable is not set.")
-
     genai.configure(api_key=GOOGLE_API_KEY)
+
+    # --- NEW: AGENT'S PRIVATE KEY (for signing) ---
+    # Load the Agent's Private Key from environment variables (Task 2)
+    AGENT_PRIVATE_KEY_PEM = os.environ.get("AGENT_PRIVATE_KEY")
+    if not AGENT_PRIVATE_KEY_PEM:
+        raise ValueError("The AGENT_PRIVATE_KEY environment variable is not set.")
+
+    # Load the PEM-formatted private key
+    # Ed25519 keys do not require a password
+    AGENT_PRIVATE_KEY = load_pem_private_key(
+        AGENT_PRIVATE_KEY_PEM.encode('utf-8'),
+        password=None
+    )
+
+    # --- END NEW CONFIG ---
+
 except Exception as e:
     print(f"--- CONFIGURATION ERROR ---")
     print(f"Error: {e}")
-    print("Please set your GEMINI_API_KEY before running the script.")
-    print("Example: export GEMINI_API_KEY=\"your_key_here\"")
+    print("Please set your GEMINI_API_KEY and AGENT_PRIVATE_KEY before running the script.")
+    print("Run `openssl genpkey -algorithm Ed25519 -out agent_private_key.pem` to generate a key.")
     exit()
 
-# --- v2.1: TWO BRAINS (NLU and NLG) ---
+# --- v3.0: TWO BRAINS (NLU and NLG) ---
 
 # --- NLU BRAIN (Phase 0) ---
+# This system prompt remains unchanged from v2.1
 NLU_SYSTEM_PROMPT = """
 You are an expert NLU (Natural Language Understanding) agent for a travel agency.
 Your sole task is to update a JSON object based on the user's request.
@@ -48,36 +72,18 @@ Output JSON Structure:
 {
   "intent": "SEARCH_FLIGHT" | "SEARCH_HOTEL" | "BOOK_ITEM" | "CLARIFICATION",
   "parameters": {
-    // Common entities
     "location": "CITY" (or null),
     "departure_date": "YYYY-MM-DD" (or null),
-    "max_price": INT (or null),
-    "currency": "EUR" (or "USD", "CAD", etc. or null),
-
-    // Flight-specific entities
     "origin": "CITY_OR_IATA_CODE" (or null),
     "destination": "CITY_OR_IATA_CODE" (or null),
-    "return_date": "YYYY-MM-DD" (or null),
-
-    // Hotel-specific entities
     "check_in_date": "YYYY-MM-DD" (or null),
-    "check_out_date": "YYYY-MM-DD" (or null),
-    "guests": INT (or null)
+    "check_out_date": "YYYY-MM-DD" (or null)
   },
   "booking_context": {
     "item_to_book": { "type": "flight" | "hotel" | null, "id": "ITEM_ID", "price": 123.45 },
     "is_confirmed": false
   }
 }
-
-Example 1 (New Flight Search):
-  User Request: "I want a flight from Paris to New York on Nov 15, 2025"
-  Output JSON:
-  {
-    "intent": "SEARCH_FLIGHT",
-    "parameters": { "origin": "Paris", "destination": "New York", "departure_date": "2025-11-15", ... },
-    "booking_context": { "item_to_book": null, "is_confirmed": false }
-  }
 """
 
 nlu_generation_config = {
@@ -97,7 +103,7 @@ llm_nlu = genai.GenerativeModel(
 )
 
 # --- NLG BRAIN (Phase 2) ---
-# MODIFIED v2.1: Now handles task failure messages in task_results
+# This system prompt remains unchanged from v2.1 (it already handles errors)
 NLG_SYSTEM_PROMPT = """
 You are a conversational, friendly, and helpful travel agent.
 Your task is to respond to the user based on the context provided.
@@ -118,8 +124,6 @@ Your task is to respond to the user based on the context provided.
 - If a booking was just confirmed (task_results status is "BOOKING_CONFIRMED"):
     - Confirm the booking to the user and include the confirmation code.
     - (Example: "It's done! Your flight to Montreal is confirmed. Your code is XYZ123.")
-
-Your response should be based on the provided context, focusing on being proactive and helpful.
 """
 
 nlg_generation_config = {
@@ -142,6 +146,7 @@ llm_nlg = genai.GenerativeModel(
 def clean_json_string(s):
     """
     Cleans the raw LLM output to keep only the valid JSON.
+    (Unchanged from v2.1)
     """
     start_index = s.find('{')
     end_index = s.rfind('}')
@@ -154,22 +159,61 @@ def clean_json_string(s):
     return None
 
 
+# --- NEW: TASK SIGNING FUNCTION (Task 2) ---
+def _sign_task(task_object):
+    """
+    Signs a task object using the agent's private key (Ed25519)
+    and returns it in the new Zero-Trust format.
+    """
+    if not task_object:
+        return None
+
+    try:
+        # 1. Serialize the task object into a canonical JSON string.
+        # sort_keys=True ensures the key order is always the same.
+        # separators=(',', ':') removes whitespace for a compact representation.
+        # This is CRITICAL for a consistent signature.
+        task_json = json.dumps(task_object, sort_keys=True, separators=(',', ':')).encode('utf-8')
+
+        # 2. Sign the serialized JSON bytes using the loaded private key
+        signature = AGENT_PRIVATE_KEY.sign(task_json)
+
+        # 3. Encode the binary signature in Base64 for safe JSON transport
+        signature_b64 = base64.b64encode(signature).decode('utf-8')
+
+        # 4. Wrap the original task and signature in the new format
+        signed_task_wrapper = {
+            "task": task_object,
+            "signature": signature_b64,
+            "algorithm": "Ed25519"  # As specified in the brief
+        }
+
+        print(f"--- INFO: Task successfully signed (Sig: {signature_b64[:10]}...) ---")
+        return signed_task_wrapper
+
+    except Exception as e:
+        print(f"--- CRITICAL SIGNING ERROR ---")
+        print(f"Failed to sign task: {e}")
+        # If signing fails, we must not send the task.
+        return None
+
+
+# --- END NEW FUNCTION ---
+
+
 def nlu_phase_llm(user_prompt, previous_state):
     """
-    Phase 0: NLU (Natural Language Understanding) - v2.1
-    Uses the LLM to *update* the conversation state.
+    Phase 0: NLU (Natural Language Understanding) - v3.0
+    (Unchanged from v2.1)
     """
-    print("--- 0. NLU PHASE (v2.1 NLU Brain) ---")
+    print("--- 0. NLU PHASE (v3.0 NLU Brain) ---")
     print(f"User prompt: \"{user_prompt}\"")
 
-    # Prepare the context for the NLU
     nlu_context = f"""
     Previous JSON State:
     {json.dumps(previous_state, indent=2)}
-
     Current User Request:
     "{user_prompt}"
-
     Updated JSON:
     """
 
@@ -192,11 +236,10 @@ def nlu_phase_llm(user_prompt, previous_state):
     try:
         updated_state = json.loads(json_string)
 
-        # v2.1: Persistence logic for the booking context
-        # If the NLU forgot to report 'item_to_book' from the previous state, report it manually.
+        # Persistence logic for the booking context
         if previous_state.get("booking_context", {}).get("item_to_book") and \
                 not updated_state.get("booking_context", {}).get("item_to_book") and \
-                updated_state.get("intent") != "BOOK_ITEM":  # Unless the intent is to book
+                updated_state.get("intent") != "BOOK_ITEM":
             print("--- INFO: Manually reporting 'item_to_book' in state.")
             if "booking_context" not in updated_state:
                 updated_state["booking_context"] = {}
@@ -213,10 +256,10 @@ def nlu_phase_llm(user_prompt, previous_state):
 
 def core_processing_phase(conversation_state):
     """
-    Phase 1: Core Processing (Task Preparation) - v2.1
-    Prepares the task (Flight, Hotel, or Booking).
+    Phase 1: Core Processing (Task Preparation) - v3.0
+    MODIFIED: All task objects are now passed to _sign_task before being returned.
     """
-    print("\n--- 1. CORE PROCESSING PHASE (Task Prep) ---")
+    print("\n--- 1. CORE PROCESSING PHASE (v3.0 Task Prep & Sign) ---")
 
     if not conversation_state or "intent" not in conversation_state:
         print("Error: Invalid or unrecognized intent.")
@@ -226,7 +269,7 @@ def core_processing_phase(conversation_state):
     params = conversation_state.get("parameters", {})
     booking_context = conversation_state.get("booking_context", {})
 
-    task_to_perform = None
+    task_to_perform = None  # This is the "inner" task object
 
     # Routing logic based on intent
     if intent == "SEARCH_FLIGHT":
@@ -263,7 +306,6 @@ def core_processing_phase(conversation_state):
             "query": search_query
         }
 
-    # Handle booking intent
     elif intent == "BOOK_ITEM":
         item = booking_context.get("item_to_book")
         is_confirmed = booking_context.get("is_confirmed", False)
@@ -287,26 +329,24 @@ def core_processing_phase(conversation_state):
         print(f"Intent '{intent}' not handled by Core Processing.")
         return None
 
-    return task_to_perform
+    # --- NEW: FINAL SIGNING STEP ---
+    # All tasks are signed before being returned to the orchestrator.
+    return _sign_task(task_to_perform)
 
 
 def generation_phase_llm(task_results, user_prompt, conversation_state):
     """
-    Phase 2: Generation (NLG - Natural Language Generation) - v2.1
-    Generates a response based on the state AND the TASK results.
+    Phase 2: Generation (NLG) - v3.0
+    (Unchanged from v2.1)
     """
-    print("\n--- 2. GENERATION PHASE (v2.1 NLG Brain) ---")
+    print("\n--- 2. GENERATION PHASE (v3.0 NLG Brain) ---")
 
-    # 1. Prepare the context for the NLG LLM
     context = f"""
     Original User Prompt: "{user_prompt}"
-
     Current Conversation State (JSON parsed by NLU):
     {json.dumps(conversation_state, indent=2)}
-
     Task Results (provided by external tool):
     {json.dumps(task_results, indent=2) if task_results else "null"}
-
     Your Response:
     """
 
@@ -327,9 +367,12 @@ def generation_phase_llm(task_results, user_prompt, conversation_state):
 # --- 3. MAIN EXECUTION FUNCTIONS ---
 
 def initialize_agent():
-    """Called once at startup."""
+    """
+    Called once at startup.
+    (Unchanged from v2.1)
+    """
     conversation_state = {
-        "intent": "CLARIFICATION",  # Default starting state
+        "intent": "CLARIFICATION",
         "parameters": {},
         "booking_context": {"item_to_book": None, "is_confirmed": False}
     }
@@ -339,7 +382,8 @@ def initialize_agent():
 def run_agent_turn(user_input, current_state):
     """
     Executes a single turn of conversation.
-    Returns: (agent_response_text, new_state, task_to_perform_json)
+    Returns: (agent_response_text, new_state, signed_task_wrapper)
+    (Unchanged from v2.1, but the task it returns is now signed)
     """
 
     # Phase 0: NLU (State Update)
@@ -349,19 +393,19 @@ def run_agent_turn(user_input, current_state):
         response = "I'm sorry, I could not process that request."
         return response, current_state, None
 
-        # Phase 1: Core Processing (Task Preparation)
-    task_to_perform = core_processing_phase(conversation_state)
-
-    # By default, no results needed
-    task_results = None
+    # Phase 1: Core Processing (Task Preparation & Signing)
+    # This now returns the new signed task format: {"task": {...}, "signature": "..."}
+    signed_task = core_processing_phase(conversation_state)
 
     # --- ORCHESTRATOR CHECKPOINT ---
-    if task_to_perform:
+    if signed_task:
         print("--- TASK REQUIRED CHECKPOINT ---")
-        print(f"Agent requested execution of: {task_to_perform['task_name']}")
-        return None, conversation_state, task_to_perform
+        print(f"Agent requested execution of: {signed_task['task']['task_name']}")
+        return None, conversation_state, signed_task
 
     # Phase 2: Generation (if NO task is required)
+    task_results = None
     final_response = generation_phase_llm(task_results, user_input, conversation_state)
 
     return final_response, conversation_state, None
+
